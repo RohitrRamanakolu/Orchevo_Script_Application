@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Node.js
+node_modules/
+
+# OS specific
+.DS_Store
+
+# Backend temp scripts
+backend/tmp*.py
