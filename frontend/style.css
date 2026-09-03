@@ -1,0 +1,672 @@
+/* ── Design Tokens — Odisha Government Inspired Light Theme ───────────── */
+@import url('https://fonts.googleapis.com/css2?family=Noto+Sans:wght@300;400;500;600;700&family=Noto+Sans+Oriya:wght@400;500;700&display=swap');
+
+:root {
+  /* Government palette — saffron / navy / white */
+  --bg-primary:    #ffffff;
+  --bg-secondary:  #f7f8fa;
+  --bg-tertiary:   #eef1f5;
+  --bg-elevated:   #ffffff;
+
+  /* Header — deep navy-green inspired by official Odisha gov header */
+  --header-bg:       linear-gradient(135deg, #1a3a5c, #0d2137);
+  --header-text:     #ffffff;
+  --header-accent:   #f7941d;
+
+  /* Saffron / Orange accent — from the Ashoka chakra & gov branding */
+  --accent-primary:  #e8721a;
+  --accent-light:    #f7941d;
+  --accent-bg:       rgba(247, 148, 29, 0.08);
+  --accent-border:   rgba(247, 148, 29, 0.25);
+
+  /* Deep blue secondary — from Odisha gov nav */
+  --navy:            #1a3a5c;
+  --navy-light:      #2d5a8e;
+  --navy-bg:         rgba(26, 58, 92, 0.05);
+
+  /* Green for success/active — Odisha state color */
+  --green:           #2e7d32;
+  --green-light:     #4caf50;
+  --green-bg:        rgba(46, 125, 50, 0.08);
+
+  /* Text */
+  --text-primary:    #1a1a2e;
+  --text-secondary:  #4a5568;
+  --text-muted:      #94a3b8;
+  --text-on-dark:    #ffffff;
+
+  /* Semantic */
+  --success:   #2e7d32;
+  --error:     #c62828;
+  --warning:   #f57f17;
+
+  /* Borders */
+  --border-light:  #e2e8f0;
+  --border-medium: #cbd5e1;
+
+  /* Spacing & shape */
+  --radius-sm:  6px;
+  --radius-md:  10px;
+  --radius-lg:  14px;
+  --radius-xl:  20px;
+
+  /* Shadow */
+  --shadow-sm: 0 1px 3px rgba(0, 0, 0, 0.06);
+  --shadow-md: 0 4px 12px rgba(0, 0, 0, 0.08);
+  --shadow-lg: 0 8px 30px rgba(0, 0, 0, 0.1);
+
+  /* Font — Noto Sans for clean gov readability */
+  --font-ui:   'Noto Sans', 'Noto Sans Oriya', system-ui, -apple-system, sans-serif;
+}
+
+
+/* ── Reset & Base ─────────────────────────────────────────────────────── */
+*, *::before, *::after {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+html, body {
+  height: 100%;
+  font-family: var(--font-ui);
+  background: var(--bg-secondary);
+  color: var(--text-primary);
+  overflow: hidden;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+
+/* ── App Shell ────────────────────────────────────────────────────────── */
+.app {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+  max-width: 900px;
+  margin: 0 auto;
+}
+
+
+/* ── Top Banner — Saffron stripe like gov websites ────────────────────── */
+.gov-banner {
+  background: linear-gradient(90deg, #ff9933, #f7941d, #ff9933);
+  height: 4px;
+  flex-shrink: 0;
+}
+
+
+/* ── Header — Navy bar with gov styling ───────────────────────────────── */
+.header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px 20px;
+  background: var(--header-bg);
+  color: var(--header-text);
+  flex-shrink: 0;
+  box-shadow: var(--shadow-md);
+  position: relative;
+}
+
+.header::after {
+  content: '';
+  position: absolute;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  height: 3px;
+  background: linear-gradient(90deg, #ff9933, #ffffff, #138808);
+}
+
+.header-left {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.logo {
+  width: 40px;
+  height: 40px;
+  border-radius: 50%;
+  background: #ffffff;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 22px;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.2);
+  flex-shrink: 0;
+}
+
+.header-info {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+.header-title {
+  font-size: 17px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  line-height: 1.2;
+}
+
+.header-subtitle {
+  font-size: 11px;
+  opacity: 0.75;
+  font-weight: 400;
+  letter-spacing: 0.02em;
+}
+
+.header-right {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.btn-icon {
+  width: 34px;
+  height: 34px;
+  border-radius: var(--radius-sm);
+  border: 1px solid rgba(255, 255, 255, 0.2);
+  background: rgba(255, 255, 255, 0.1);
+  color: var(--header-text);
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: all 0.2s ease;
+  font-size: 15px;
+}
+
+.btn-icon:hover {
+  background: rgba(255, 255, 255, 0.2);
+  border-color: rgba(255, 255, 255, 0.35);
+}
+
+
+/* ── Chat Area ────────────────────────────────────────────────────────── */
+.chat-area {
+  flex: 1;
+  overflow-y: auto;
+  padding: 20px 16px;
+  scroll-behavior: smooth;
+  background: var(--bg-secondary);
+}
+
+.chat-area::-webkit-scrollbar {
+  width: 5px;
+}
+.chat-area::-webkit-scrollbar-track {
+  background: transparent;
+}
+.chat-area::-webkit-scrollbar-thumb {
+  background: var(--border-medium);
+  border-radius: 10px;
+}
+.chat-area::-webkit-scrollbar-thumb:hover {
+  background: var(--text-muted);
+}
+
+
+/* ── Welcome Screen ──────────────────────────────────────────────────── */
+.welcome {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  height: 100%;
+  gap: 20px;
+  animation: fade-up 0.5s ease;
+}
+
+@keyframes fade-up {
+  from { opacity: 0; transform: translateY(16px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+.welcome-emblem {
+  width: 80px;
+  height: 80px;
+  border-radius: 50%;
+  background: var(--navy-bg);
+  border: 3px solid var(--border-light);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 40px;
+  box-shadow: var(--shadow-md);
+}
+
+.welcome h1 {
+  font-size: 22px;
+  font-weight: 600;
+  color: var(--navy);
+  letter-spacing: -0.01em;
+}
+
+.welcome p {
+  color: var(--text-secondary);
+  font-size: 14px;
+  text-align: center;
+  max-width: 420px;
+  line-height: 1.65;
+}
+
+.quick-prompts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  justify-content: center;
+  max-width: 520px;
+  margin-top: 4px;
+}
+
+.quick-prompt {
+  padding: 9px 18px;
+  border-radius: var(--radius-xl);
+  border: 1px solid var(--border-light);
+  background: var(--bg-elevated);
+  color: var(--text-secondary);
+  font-size: 13px;
+  cursor: pointer;
+  transition: all 0.2s ease;
+  box-shadow: var(--shadow-sm);
+  font-family: var(--font-ui);
+}
+
+.quick-prompt:hover {
+  background: var(--accent-bg);
+  border-color: var(--accent-primary);
+  color: var(--accent-primary);
+  transform: translateY(-1px);
+  box-shadow: var(--shadow-md);
+}
+
+
+/* ── Messages ─────────────────────────────────────────────────────────── */
+.messages {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.message {
+  display: flex;
+  gap: 10px;
+  animation: msg-in 0.3s ease;
+  max-width: 100%;
+}
+
+@keyframes msg-in {
+  from { opacity: 0; transform: translateY(10px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+.message.user {
+  flex-direction: row-reverse;
+}
+
+.message-avatar {
+  width: 32px;
+  height: 32px;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 14px;
+  flex-shrink: 0;
+  margin-top: 2px;
+  box-shadow: var(--shadow-sm);
+}
+
+.message.user .message-avatar {
+  background: linear-gradient(135deg, var(--navy), var(--navy-light));
+  color: #fff;
+}
+
+.message.assistant .message-avatar {
+  background: linear-gradient(135deg, var(--accent-primary), var(--accent-light));
+  color: #fff;
+}
+
+.message-content {
+  padding: 12px 16px;
+  border-radius: var(--radius-md);
+  max-width: 80%;
+  line-height: 1.7;
+  font-size: 14px;
+}
+
+.message.user .message-content {
+  background: var(--navy);
+  color: var(--text-on-dark);
+  border-top-right-radius: 3px;
+  box-shadow: var(--shadow-sm);
+}
+
+.message.assistant .message-content {
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-light);
+  border-top-left-radius: 3px;
+  box-shadow: var(--shadow-sm);
+  color: var(--text-primary);
+}
+
+/* Markdown inside messages */
+.message-content p { margin-bottom: 8px; }
+.message-content p:last-child { margin-bottom: 0; }
+
+.message-content strong { font-weight: 600; }
+
+.message-content code {
+  font-family: 'Consolas', 'Courier New', monospace;
+  font-size: 12.5px;
+  padding: 2px 5px;
+  border-radius: 4px;
+  background: var(--bg-tertiary);
+  border: 1px solid var(--border-light);
+}
+
+.message.user .message-content code {
+  background: rgba(255, 255, 255, 0.15);
+  border-color: rgba(255, 255, 255, 0.2);
+}
+
+.message-content pre {
+  margin: 8px 0;
+  padding: 12px;
+  border-radius: var(--radius-sm);
+  background: #1e293b;
+  border: 1px solid var(--border-light);
+  overflow-x: auto;
+  color: #e2e8f0;
+}
+
+.message-content pre code {
+  padding: 0;
+  border: none;
+  background: none;
+  font-size: 12.5px;
+  line-height: 1.5;
+  color: #e2e8f0;
+}
+
+.message-content ul,
+.message-content ol {
+  margin: 6px 0;
+  padding-left: 20px;
+}
+
+.message-content li {
+  margin-bottom: 4px;
+}
+
+.message-content a {
+  color: var(--navy-light);
+  text-decoration: underline;
+  text-decoration-color: rgba(45, 90, 142, 0.3);
+  text-underline-offset: 2px;
+}
+
+.message-content a:hover {
+  text-decoration-color: var(--navy-light);
+}
+
+
+/* ── Streaming indicator ──────────────────────────────────────────────── */
+.streaming-cursor {
+  display: inline-block;
+  width: 2px;
+  height: 16px;
+  background: var(--accent-primary);
+  margin-left: 2px;
+  vertical-align: text-bottom;
+  animation: blink 0.8s step-end infinite;
+}
+
+@keyframes blink {
+  50% { opacity: 0; }
+}
+
+
+/* ── Error message ────────────────────────────────────────────────────── */
+.message-error {
+  color: var(--error);
+  padding: 10px 14px;
+  border-radius: var(--radius-sm);
+  background: rgba(198, 40, 40, 0.06);
+  border: 1px solid rgba(198, 40, 40, 0.2);
+  font-size: 13px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.message-error .retry-btn {
+  margin-left: auto;
+  padding: 5px 14px;
+  border-radius: var(--radius-sm);
+  border: 1px solid rgba(198, 40, 40, 0.3);
+  background: transparent;
+  color: var(--error);
+  cursor: pointer;
+  font-size: 12px;
+  font-family: var(--font-ui);
+  transition: all 0.2s ease;
+}
+
+.message-error .retry-btn:hover {
+  background: rgba(198, 40, 40, 0.08);
+}
+
+
+/* ── Thinking dots ────────────────────────────────────────────────────── */
+.thinking-dots {
+  display: flex;
+  gap: 4px;
+  padding: 4px 0;
+}
+
+.thinking-dots span {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--accent-primary);
+  animation: dot-bounce 1.4s ease-in-out infinite;
+}
+
+.thinking-dots span:nth-child(2) { animation-delay: 0.2s; }
+.thinking-dots span:nth-child(3) { animation-delay: 0.4s; }
+
+@keyframes dot-bounce {
+  0%, 80%, 100% { transform: scale(0.6); opacity: 0.4; }
+  40%           { transform: scale(1); opacity: 1; }
+}
+
+
+/* ── Input Area ───────────────────────────────────────────────────────── */
+.input-area {
+  padding: 12px 16px 16px;
+  background: var(--bg-primary);
+  border-top: 1px solid var(--border-light);
+  flex-shrink: 0;
+}
+
+.input-container {
+  display: flex;
+  align-items: flex-end;
+  gap: 8px;
+  padding: 8px 8px 8px 16px;
+  border-radius: var(--radius-lg);
+  background: var(--bg-primary);
+  border: 1.5px solid var(--border-medium);
+  transition: all 0.2s ease;
+  box-shadow: var(--shadow-sm);
+}
+
+.input-container:focus-within {
+  border-color: var(--accent-primary);
+  box-shadow: 0 0 0 3px rgba(247, 148, 29, 0.12), var(--shadow-md);
+}
+
+.input-container textarea {
+  flex: 1;
+  border: none;
+  outline: none;
+  background: transparent;
+  color: var(--text-primary);
+  font-family: var(--font-ui);
+  font-size: 14px;
+  line-height: 1.5;
+  resize: none;
+  max-height: 150px;
+  padding: 6px 0;
+}
+
+.input-container textarea::placeholder {
+  color: var(--text-muted);
+}
+
+.btn-attach {
+  width: 36px;
+  height: 36px;
+  border-radius: var(--radius-sm);
+  border: none;
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 17px;
+  transition: all 0.2s ease;
+  flex-shrink: 0;
+}
+
+.btn-attach:hover {
+  color: var(--accent-primary);
+  background: var(--accent-bg);
+}
+
+.btn-attach.has-file {
+  color: var(--accent-primary);
+}
+
+.btn-send {
+  width: 36px;
+  height: 36px;
+  border-radius: var(--radius-sm);
+  border: none;
+  background: var(--accent-primary);
+  color: #fff;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 15px;
+  transition: all 0.2s ease;
+  flex-shrink: 0;
+}
+
+.btn-send:hover {
+  background: var(--accent-light);
+  box-shadow: 0 2px 8px rgba(247, 148, 29, 0.3);
+}
+
+.btn-send:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.btn-send.streaming {
+  background: var(--error);
+  animation: pulse-stop 1.5s ease-in-out infinite;
+}
+
+@keyframes pulse-stop {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(198, 40, 40, 0.3); }
+  50%      { box-shadow: 0 0 0 5px rgba(198, 40, 40, 0); }
+}
+
+.input-hint {
+  text-align: center;
+  font-size: 11px;
+  color: var(--text-muted);
+  margin-top: 8px;
+}
+
+.input-hint kbd {
+  padding: 1px 5px;
+  border-radius: 3px;
+  background: var(--bg-tertiary);
+  border: 1px solid var(--border-light);
+  font-family: 'Consolas', monospace;
+  font-size: 10px;
+}
+
+
+/* ── File attachment chip ─────────────────────────────────────────────── */
+.file-chip {
+  display: none;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 12px;
+  border-radius: 16px;
+  background: var(--accent-bg);
+  border: 1px solid var(--accent-border);
+  font-size: 12px;
+  color: var(--accent-primary);
+  margin-bottom: 8px;
+}
+
+.file-chip.visible {
+  display: inline-flex;
+}
+
+.file-chip .remove-file {
+  cursor: pointer;
+  opacity: 0.6;
+  transition: opacity 0.2s;
+}
+
+.file-chip .remove-file:hover {
+  opacity: 1;
+}
+
+
+/* ── Footer credit ────────────────────────────────────────────────────── */
+.footer-credit {
+  text-align: center;
+  font-size: 10px;
+  color: var(--text-muted);
+  padding: 4px 0 8px;
+  background: var(--bg-primary);
+  letter-spacing: 0.02em;
+}
+
+
+/* ── Responsive ───────────────────────────────────────────────────────── */
+@media (max-width: 600px) {
+  .message-content {
+    max-width: 88%;
+    font-size: 13.5px;
+  }
+
+  .quick-prompts {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .welcome h1 {
+    font-size: 18px;
+  }
+
+  .header-title {
+    font-size: 14px;
+  }
+
+  .header-subtitle {
+    display: none;
+  }
+}
