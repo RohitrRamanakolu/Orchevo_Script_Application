@@ -10,6 +10,7 @@ This repository features a modern, government-themed chat UI and a robust Python
 - **Session Continuity**: Retains your conversation context across multiple chat messages by preserving the platform session ID in the backend.
 - **Real-time SSE Streaming**: Instantly streams the AI's response tokens directly to the UI as they are generated.
 - **Odisha Government Aesthetic**: Clean, responsive light theme featuring tricolor accents, Noto Sans typography, and dual-language (English/Odia) support.
+- **React + TypeScript + MUI Frontend**: Component-based chat UI built with Vite, typed end-to-end, and styled with Material UI.
 
 ---
 
@@ -23,9 +24,16 @@ Orchevo_Script_Application/
 │   ├── script_transformer.py  # AST parser for injecting inputs/sessions dynamically
 │   └── requirements.txt       # Python dependencies
 └── frontend/
-    ├── index.html             # Main chat interface
-    ├── style.css              # Custom theming and animations
-    └── app.js                 # Frontend streaming logic
+    ├── index.html             # Vite entry HTML
+    ├── src/
+    │   ├── main.tsx           # React app bootstrap
+    │   ├── App.tsx            # Chat state & orchestration
+    │   ├── theme.ts           # MUI theme (gov. saffron/navy palette)
+    │   ├── api/chat.ts        # SSE streaming client
+    │   ├── utils/markdown.ts  # Markdown → HTML renderer
+    │   └── components/        # Header, WelcomeScreen, ChatInput, MessageBubble, ...
+    ├── package.json
+    └── vite.config.ts
 ```
 
 ---
@@ -34,23 +42,38 @@ Orchevo_Script_Application/
 
 ### Prerequisites
 - **Python 3.11+**
+- **Node.js 20+**
 
-### 1. Install Dependencies
-Navigate to the `backend` directory and install the required Python packages:
+### 1. Install Backend Dependencies
 
 ```bash
 cd backend
 pip install -r requirements.txt
 ```
 
-*(Note: The frontend is entirely static HTML/CSS/JS and does not require Node.js or `npm install`)*
+### 2. Install Frontend Dependencies
+
+```bash
+cd frontend
+npm install
+```
+
+### 3. Build the Frontend
+The backend serves the compiled frontend from `frontend/dist`, so build it before starting the server (and re-run this after any frontend change):
+
+```bash
+cd frontend
+npm run build
+```
+
+For frontend-only development with hot reload, run `npm run dev` instead (proxies `/api` requests to `http://localhost:8000`).
 
 ---
 
 ## Running the Application
 
 ### Start the Server
-Run the FastAPI backend server using Uvicorn. The server is configured to serve both the API endpoints and the frontend static files.
+Run the FastAPI backend server using Uvicorn. The server is configured to serve both the API endpoints and the built frontend (`frontend/dist`).
 
 ```bash
 cd backend

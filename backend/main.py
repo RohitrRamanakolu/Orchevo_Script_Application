@@ -217,4 +217,4 @@ async def chat_stream(
 
 
 # ── Static frontend ──────────────────────────────────────────────────────
-app.mount("/", StaticFiles(directory="../frontend", html=True), name="frontend")
+app.mount("/", StaticFiles(directory="../frontend/dist", html=True), name="frontend")

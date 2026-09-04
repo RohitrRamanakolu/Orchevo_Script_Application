@@ -9,6 +9,8 @@ env/
 
 # Node.js
 node_modules/
+frontend/dist/
+frontend/*.tsbuildinfo
 
 # OS specific
 .DS_Store
