@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import sys
 import tempfile
 import traceback
 from typing import Any
@@ -130,7 +131,7 @@ def _run_script_and_stream(query: str, client_id: str, uploaded_file_path: str |
         env["PYTHONUNBUFFERED"] = "1"
 
         process = subprocess.Popen(
-            ["python", tmp_path],
+            [sys.executable, tmp_path],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             env=env,
