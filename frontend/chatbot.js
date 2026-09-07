@@ -6,9 +6,12 @@
 
 /* ── Constants ────────────────────────────────────────────────────────── */
 const API_BASE = window.location.origin;
+const WS_BASE = API_BASE.replace(/^https/, "wss").replace(/^http/, "ws");
 const ENDPOINTS = Object.freeze({
-  CHAT_STREAM: `${API_BASE}/api/chat/stream`,
-  HEALTH:      `${API_BASE}/api/health-check`,
+  CHAT_STREAM:    `${API_BASE}/api/chat/stream`,
+  AUDIO_EXECUTE:  `${API_BASE}/api/audio/execute`,
+  AUDIO_WS:       (streamId) => `${WS_BASE}/api/audio/stream/${streamId}`,
+  HEALTH:         `${API_BASE}/api/health-check`,
 });
 
 const AUTO_SCROLL_THRESHOLD_PX = 140;
@@ -21,6 +24,11 @@ let attachedFile    = null;
 let speechRecognizer = null;
 let isListening     = false;
 let isWebSearchOn   = false;
+
+// Audio streaming state
+let audioWs         = null;   // WebSocket to backend audio proxy
+let mediaRecorder   = null;   // MediaRecorder capturing mic
+let audioStream     = null;   // getUserMedia stream handle
 
 /* ── DOM Elements ─────────────────────────────────────────────────────── */
 const chatViewport     = document.getElementById("chat-viewport");
@@ -496,11 +504,28 @@ function resetChat() {
   updateSendControls();
 }
 
-/** Initialize Speech Recognition (Mic). */
-function setupSpeechRecognition() {
-  const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+/** Set up mic: use live binary audio streaming on HTTPS, fall back to
+ *  browser SpeechRecognition on plain HTTP (where getUserMedia is blocked).
+ */
+function setupAudioStreaming() {
+  if (!btnMic) return;
+  const hasGetUserMedia =
+    navigator.mediaDevices && navigator.mediaDevices.getUserMedia;
+
+  if (hasGetUserMedia) {
+    // HTTPS / localhost — full binary streaming available
+    btnMic.title = "Voice Input (Live Stream)";
+    return;
+  }
+
+  // Plain HTTP (e.g. http://<IP>:8000) — getUserMedia is blocked by browser.
+  // Fall back to webkitSpeechRecognition so the button still works.
+  const SpeechRecognition =
+    window.SpeechRecognition || window.webkitSpeechRecognition;
+
   if (!SpeechRecognition) {
-    btnMic.title = "Speech recognition is not supported in this browser.";
+    btnMic.title = "Voice input unavailable (need HTTPS or Chrome/Edge).";
+    btnMic.disabled = true;
     return;
   }
 
@@ -512,7 +537,7 @@ function setupSpeechRecognition() {
   speechRecognizer.onstart = () => {
     isListening = true;
     btnMic.classList.add("listening");
-    btnMic.title = "Listening... Click to stop";
+    btnMic.title = "Listening… Click to stop";
   };
 
   speechRecognizer.onresult = (event) => {
@@ -525,38 +550,207 @@ function setupSpeechRecognition() {
   };
 
   speechRecognizer.onerror = (err) => {
-    console.warn("Speech recognition error:", err);
-    stopListening();
+    console.warn("SpeechRecognition error:", err);
+    isListening = false;
+    btnMic.classList.remove("listening");
+    btnMic.title = "Voice Input";
   };
 
   speechRecognizer.onend = () => {
-    stopListening();
+    isListening = false;
+    btnMic.classList.remove("listening");
+    btnMic.title = "Voice Input";
   };
+
+  btnMic.title = "Voice Input (Dictation mode — serve over HTTPS for live audio)";
 }
 
-function stopListening() {
+/** Stop and clean up an active audio stream session. */
+function stopAudioStream() {
   isListening = false;
   btnMic.classList.remove("listening");
   btnMic.title = "Voice Input";
-  if (speechRecognizer) {
-    try { speechRecognizer.stop(); } catch {}
+
+  if (mediaRecorder && mediaRecorder.state !== "inactive") {
+    try { mediaRecorder.stop(); } catch {}
   }
+  mediaRecorder = null;
+
+  if (audioStream) {
+    audioStream.getTracks().forEach(t => t.stop());
+    audioStream = null;
+  }
+
+  if (audioWs && audioWs.readyState === WebSocket.OPEN) {
+    try { audioWs.send("__end__"); } catch {}
+    try { audioWs.close(); } catch {}
+  }
+  audioWs = null;
 }
 
-function toggleVoiceInput() {
-  if (!speechRecognizer) {
-    alert("Voice dictation is not supported in your browser (requires Chrome/Edge/Safari).");
+/**
+ * Toggle live audio streaming mic on/off.
+ * On start: get mic → open WS → start MediaRecorder → fire /api/audio/execute.
+ * On stop: send "__end__" → close WS → stream response into chat like text.
+ */
+async function toggleAudioStream() {
+  if (isStreaming) return; // don't allow mic while text stream in progress
+
+  // ── HTTP / no-getUserMedia fallback: use browser SpeechRecognition ──────
+  if (speechRecognizer) {
+    if (isListening) {
+      isListening = false;
+      btnMic.classList.remove("listening");
+      btnMic.title = "Voice Input (Dictation mode — serve over HTTPS for live audio)";
+      try { speechRecognizer.stop(); } catch {}
+    } else {
+      try { speechRecognizer.start(); } catch (e) {
+        console.error("SpeechRecognition start error:", e);
+      }
+    }
     return;
   }
+
+  // ── HTTPS / localhost path: full binary streaming ───────────────────────
   if (isListening) {
-    stopListening();
-  } else {
-    try {
-      speechRecognizer.start();
-    } catch (e) {
-      console.error("SpeechRecognition start error:", e);
-    }
+    stopAudioStream();
+    return;
   }
+
+  try {
+    audioStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+  } catch (err) {
+    alert(`Microphone access denied: ${err.message}`);
+    return;
+  }
+
+  isListening = true;
+  btnMic.classList.add("listening");
+  btnMic.title = "Recording… Click to stop and send";
+
+  // Generate unique stream ID
+  const streamId = crypto.randomUUID
+    ? crypto.randomUUID()
+    : `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+
+  // Open WebSocket to backend proxy FIRST
+  audioWs = new WebSocket(ENDPOINTS.AUDIO_WS(streamId));
+  audioWs.binaryType = "arraybuffer";
+
+  audioWs.onerror = (e) => {
+    console.error("Audio WS error:", e);
+    stopAudioStream();
+    appendErrorCard("Audio WebSocket connection failed. Is the server running?", "");
+  };
+
+  // Wait for WS to open before starting MediaRecorder
+  await new Promise((resolve, reject) => {
+    audioWs.onopen = resolve;
+    audioWs.onerror = reject;
+  }).catch(() => {
+    stopAudioStream();
+    return;
+  });
+
+  if (!audioWs || audioWs.readyState !== WebSocket.OPEN) return;
+
+  // Set up MediaRecorder — prefer Opus/WebM if supported
+  const mimeType = MediaRecorder.isTypeSupported("audio/webm;codecs=opus")
+    ? "audio/webm;codecs=opus"
+    : "audio/webm";
+
+  mediaRecorder = new MediaRecorder(audioStream, { mimeType, timeslice: 250 });
+
+  mediaRecorder.ondataavailable = (e) => {
+    if (e.data && e.data.size > 0 && audioWs && audioWs.readyState === WebSocket.OPEN) {
+      e.data.arrayBuffer().then(buf => {
+        if (audioWs && audioWs.readyState === WebSocket.OPEN) {
+          audioWs.send(buf);
+        }
+      });
+    }
+  };
+
+  mediaRecorder.onstop = async () => {
+    // Send end sentinel and close WS
+    if (audioWs && audioWs.readyState === WebSocket.OPEN) {
+      try { audioWs.send("__end__"); } catch {}
+      setTimeout(() => { try { audioWs.close(); } catch {} }, 300);
+    }
+
+    // Now fire /api/audio/execute — the audio queue is already uploaded
+    isStreaming = true;
+    updateSendControls();
+
+    // Show a placeholder message that voice was sent
+    appendUserMessage("🎤 (Voice message sent)", null);
+    const { textContainer, citationSection } = createAssistantCard();
+    let tokenBuffer = "";
+    let hasReceivedToken = false;
+
+    try {
+      const form = new FormData();
+      form.append("stream_id", streamId);
+
+      const response = await fetch(ENDPOINTS.AUDIO_EXECUTE, {
+        method: "POST",
+        body: form,
+        signal: abortController ? abortController.signal : undefined,
+      });
+
+      if (!response.ok) {
+        const errText = await response.text();
+        throw new Error(`Audio execute returned ${response.status}: ${errText}`);
+      }
+
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let streamBuf = "";
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        streamBuf += decoder.decode(value, { stream: true });
+        const lines = streamBuf.split("\n");
+        streamBuf = lines.pop();
+
+        for (const line of lines) {
+          const t = line.trim();
+          if (!t || t === "data: [DONE]" || !t.startsWith("data:")) continue;
+          let payload;
+          try { payload = JSON.parse(t.slice(5).trim()); } catch { continue; }
+          const evType = payload.event;
+          if (evType === "token") {
+            if (!hasReceivedToken) { hasReceivedToken = true; textContainer.innerHTML = ""; }
+            tokenBuffer += payload.token;
+            textContainer.innerHTML = renderMarkdown(tokenBuffer) + '<span class="streaming-cursor"></span>';
+            scrollToBottom();
+          } else if (evType === "complete") {
+            const final = payload.final_output?.output || tokenBuffer;
+            textContainer.innerHTML = renderMarkdown(final);
+            updateCitations(citationSection, final, null);
+            scrollToBottom();
+          } else if (evType === "error") {
+            throw new Error(payload.detail || "Audio workflow error");
+          }
+        }
+      }
+
+      if (tokenBuffer && textContainer.querySelector(".streaming-cursor")) {
+        textContainer.innerHTML = renderMarkdown(tokenBuffer);
+        updateCitations(citationSection, tokenBuffer, null);
+      }
+    } catch (err) {
+      textContainer.innerHTML = "";
+      appendErrorCard(err.message, "");
+    } finally {
+      isStreaming = false;
+      updateSendControls();
+      scrollToBottom();
+    }
+  };
+
+  mediaRecorder.start(250); // emit data every 250ms
 }
 
 /** Export conversation history to a markdown file. */
@@ -618,10 +812,14 @@ chatInput.addEventListener("keydown", (e) => {
   }
 });
 
-chatInput.addEventListener("input", autoResizeInput);
+if (chatInput) {
+  chatInput.addEventListener("input", autoResizeInput);
+}
 
 // New Chat button
-btnNewChat.addEventListener("click", resetChat);
+if (btnNewChat) {
+  btnNewChat.addEventListener("click", resetChat);
+}
 
 // Export Chat button
 if (btnExportChat) {
@@ -629,43 +827,55 @@ if (btnExportChat) {
 }
 
 // File Attachment handling
-btnAttach.addEventListener("click", () => fileInput.click());
+if (btnAttach && fileInput) {
+  btnAttach.addEventListener("click", () => fileInput.click());
+}
 
-fileInput.addEventListener("change", () => {
-  const file = fileInput.files[0];
-  if (file) {
-    attachedFile = file;
-    chipFileName.textContent = file.name;
-    chipFileSize.textContent = `(${formatFileSize(file.size)})`;
-    fileTray.classList.add("visible");
-    btnAttach.classList.add("has-attachment");
-  }
-});
+if (fileInput) {
+  fileInput.addEventListener("change", () => {
+    const file = fileInput.files[0];
+    if (file) {
+      attachedFile = file;
+      if (chipFileName) chipFileName.textContent = file.name;
+      if (chipFileSize) chipFileSize.textContent = `(${formatFileSize(file.size)})`;
+      if (fileTray) fileTray.classList.add("visible");
+      if (btnAttach) btnAttach.classList.add("has-attachment");
+    }
+  });
+}
 
-btnRemoveChip.addEventListener("click", clearAttachedFile);
+if (btnRemoveChip) {
+  btnRemoveChip.addEventListener("click", clearAttachedFile);
+}
 
-// Voice Mic Button
-btnMic.addEventListener("click", toggleVoiceInput);
+// Voice Mic Button — triggers live audio streaming or speech dictation
+if (btnMic) {
+  btnMic.addEventListener("click", toggleAudioStream);
+}
 
 // Web Search Toggle Pill
-btnWebSearch.addEventListener("click", () => {
-  isWebSearchOn = !isWebSearchOn;
-  btnWebSearch.classList.toggle("active", isWebSearchOn);
-  btnWebSearch.title = isWebSearchOn ? "Web Search: ON" : "Web Search: OFF";
-});
+if (btnWebSearch) {
+  btnWebSearch.addEventListener("click", () => {
+    isWebSearchOn = !isWebSearchOn;
+    btnWebSearch.classList.toggle("active", isWebSearchOn);
+    btnWebSearch.title = isWebSearchOn ? "Web Search: ON" : "Web Search: OFF";
+  });
+}
 
 // Prompt Chips Click
 document.querySelectorAll(".prompt-chip").forEach(chip => {
   chip.addEventListener("click", () => {
     const prompt = chip.getAttribute("data-prompt");
-    if (prompt) {
+    if (prompt && chatInput) {
       chatInput.value = prompt;
       autoResizeInput();
-      btnSend.click();
+      if (btnSend) btnSend.click();
     }
   });
 });
 
 /* ── Initialization ───────────────────────────────────────────────────── */
-setupSpeechRecognition();
-chatInput.focus();
+setupAudioStreaming();
+if (chatInput) {
+  chatInput.focus();
+}
