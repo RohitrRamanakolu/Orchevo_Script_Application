@@ -1,7 +1,7 @@
 import requests, json
 
-WORKFLOW_KEY = "tq4iL76n_FafgnTW4eUCM4mrnfPYsmJSvmLrNY4EKRc"
-WORKFLOW_ID  = "21b69fd2-b0bf-4ac8-8ac6-be47c14af0b9"
+WORKFLOW_KEY = "N9tuOyfTKPzLWA4IjIyz19jpONPbTK59I8xMNnQsZVE"
+WORKFLOW_ID  = "29fcf42e-56a6-4cd8-a634-062beabe3067"
 BASE_URL     = "https://map-qa.paradigmit.ai/api/v1/agent-workflows"  # change if calling a different environment
 
 # ── Step 1: Create a session (once per conversation) ──────────────────────

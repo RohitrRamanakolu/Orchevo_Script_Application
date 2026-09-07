@@ -20,7 +20,7 @@ from typing import Any
 
 from fastapi import FastAPI, File, Form, UploadFile, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 from script_transformer import rewrite_script
@@ -216,5 +216,26 @@ async def chat_stream(
     )
 
 
-# ── Static frontend ──────────────────────────────────────────────────────
-app.mount("/", StaticFiles(directory="../frontend", html=True), name="frontend")
+# ── Root → Odisha Govt Chatbot (new UI only) ────────────────────────────
+_FRONTEND_DIR: str = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "frontend")
+_CHATBOT_HTML: str = os.path.join(_FRONTEND_DIR, "chatbot.html")
+
+
+@app.get("/", include_in_schema=False)
+def serve_chatbot() -> FileResponse:
+    """Serve the Odisha Govt Chatbot interface at the root URL.
+
+    The classic UI files (index.html, etc.) remain on disk but are not
+    wired to any backend route — they are simply not served.
+
+    Returns
+    -------
+    FileResponse
+        The chatbot.html file.
+    """
+    return FileResponse(_CHATBOT_HTML)
+
+
+# ── Static assets (css / js / svg / etc.) ────────────────────────────────
+# html=False ensures index.html is never auto-served for directory requests.
+app.mount("/", StaticFiles(directory=_FRONTEND_DIR, html=False), name="frontend")
