@@ -1,4 +1,4 @@
-import { useRef } from "react";
+import { useRef, useState } from "react";
 import type { ChangeEvent, KeyboardEvent } from "react";
 import Box from "@mui/material/Box";
 import Chip from "@mui/material/Chip";
@@ -7,13 +7,19 @@ import InputBase from "@mui/material/InputBase";
 import Typography from "@mui/material/Typography";
 import { keyframes } from "@mui/material/styles";
 import AttachFileIcon from "@mui/icons-material/AttachFile";
+import MicIcon from "@mui/icons-material/Mic";
 import PlayArrowIcon from "@mui/icons-material/PlayArrow";
 import StopIcon from "@mui/icons-material/Stop";
+import AudioAttachmentChip from "./AudioAttachmentChip";
+import { isMp3RecordingSupported, startMp3Recording } from "../utils/mp3Recorder";
+import type { Mp3RecordingHandle } from "../utils/mp3Recorder";
 
 const pulseStop = keyframes`
   0%, 100% { box-shadow: 0 0 0 0 rgba(198, 40, 40, 0.3); }
   50%      { box-shadow: 0 0 0 5px rgba(198, 40, 40, 0); }
 `;
+
+const micSupported = isMp3RecordingSupported();
 
 interface ChatInputProps {
   value: string;
@@ -37,6 +43,8 @@ export default function ChatInput({
   onRemoveFile,
 }: ChatInputProps) {
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const recordingRef = useRef<Mp3RecordingHandle | null>(null);
+  const [isRecording, setIsRecording] = useState(false);
 
   const handleKeyDown = (e: KeyboardEvent<HTMLTextAreaElement>) => {
     if (e.key === "Enter" && !e.shiftKey) {
@@ -62,22 +70,48 @@ export default function ChatInput({
     }
   };
 
+  const handleMicClick = async () => {
+    if (isRecording) {
+      const recording = recordingRef.current;
+      recordingRef.current = null;
+      setIsRecording(false);
+      if (recording) {
+        const { file } = await recording.stop();
+        onAttachFile(file);
+      }
+      return;
+    }
+
+    try {
+      recordingRef.current = await startMp3Recording();
+      setIsRecording(true);
+    } catch {
+      // Microphone permission denied or unavailable — stay idle.
+      recordingRef.current = null;
+      setIsRecording(false);
+    }
+  };
+
   return (
     <Box sx={{ px: 2, pt: 1.5, pb: 2, bgcolor: "background.paper", borderTop: "1px solid", borderColor: "divider", flexShrink: 0 }}>
-      {attachedFile && (
-        <Chip
-          label={attachedFile.name}
-          icon={<span>📎</span>}
-          onDelete={onRemoveFile}
-          size="small"
-          sx={{
-            mb: 1,
-            bgcolor: "rgba(247,148,29,0.08)",
-            border: "1px solid rgba(247,148,29,0.25)",
-            color: "primary.main",
-            "& .MuiChip-deleteIcon": { color: "primary.main" },
-          }}
-        />
+      {attachedFile && attachedFile.type.startsWith("audio/") ? (
+        <AudioAttachmentChip file={attachedFile} onRemove={onRemoveFile} />
+      ) : (
+        attachedFile && (
+          <Chip
+            label={attachedFile.name}
+            icon={<span>📎</span>}
+            onDelete={onRemoveFile}
+            size="small"
+            sx={{
+              mb: 1,
+              bgcolor: "rgba(247,148,29,0.08)",
+              border: "1px solid rgba(247,148,29,0.25)",
+              color: "primary.main",
+              "& .MuiChip-deleteIcon": { color: "primary.main" },
+            }}
+          />
+        )
       )}
 
       <Box
@@ -125,6 +159,22 @@ export default function ChatInput({
         >
           <AttachFileIcon fontSize="small" />
         </IconButton>
+        {micSupported && (
+          <IconButton
+            title={isRecording ? "Stop recording" : "Record a voice message"}
+            onClick={() => void handleMicClick()}
+            sx={{
+              width: 36,
+              height: 36,
+              borderRadius: "6px",
+              color: isRecording ? "error.main" : "text.disabled",
+              animation: isRecording ? `${pulseStop} 1.5s ease-in-out infinite` : "none",
+              "&:hover": { color: "primary.main", bgcolor: "rgba(247,148,29,0.08)" },
+            }}
+          >
+            <MicIcon fontSize="small" />
+          </IconButton>
+        )}
         <IconButton
           title={isStreaming ? "Stop" : "Send"}
           onClick={handleSendClick}
