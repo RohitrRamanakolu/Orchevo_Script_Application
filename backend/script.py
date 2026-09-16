@@ -1,6 +1,6 @@
 import requests, json
 
-WORKFLOW_KEY = "tq4iL76n_FafgnTW4eUCM4mrnfPYsmJSvmLrNY4EKRc"
+WORKFLOW_KEY = "Oo0T51TI8RLCTxPp7wPOGhD8wSwswPmE-Fd-PVR2qdo"
 WORKFLOW_ID  = "21b69fd2-b0bf-4ac8-8ac6-be47c14af0b9"
 BASE_URL     = "https://map-qa.paradigmit.ai/api/v1/agent-workflows"  # change if calling a different environment
 

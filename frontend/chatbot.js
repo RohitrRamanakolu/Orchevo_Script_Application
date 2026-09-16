@@ -1,7 +1,14 @@
 /**
  * Odisha Govt Chatbot Client
  * Handles conversational streaming with SSE, voice dictation, file attachments,
- * markdown parsing, thinking accordion, and text-to-speech.
+ * markdown parsing, thinking accordion, and bidirectional audio streaming.
+ *
+ * Audio Architecture:
+ * - INPUT:  Web Audio API ScriptProcessorNode downsamples microphone to 16 kHz
+ *           mono Int16 PCM and streams binary chunks over WebSocket.
+ * - OUTPUT: Incoming SSE audio_chunk events (base64 PCM16 @ sample_rate) are
+ *           decoded and played seamlessly via a scheduled Web Audio API buffer
+ *           queue at the chunk's native sample rate (usually 24 kHz).
  */
 
 /* ── Constants ────────────────────────────────────────────────────────── */
@@ -13,6 +20,11 @@ const ENDPOINTS = Object.freeze({
   AUDIO_WS:       (streamId) => `${WS_BASE}/api/audio/stream/${streamId}`,
   HEALTH:         `${API_BASE}/api/health-check`,
 });
+
+/** Target input sample rate required by Paradigm Platform voice/gemini-live nodes. */
+const MIC_TARGET_SAMPLE_RATE = 16000;
+/** ScriptProcessorNode buffer size — must be a power of two; 4096 ≈ 256 ms at 16 kHz. */
+const MIC_BUFFER_SIZE = 4096;
 
 const AUTO_SCROLL_THRESHOLD_PX = 140;
 const MAX_TEXTAREA_HEIGHT_PX   = 160;
@@ -26,9 +38,14 @@ let isListening     = false;
 let isWebSearchOn   = false;
 
 // Audio streaming state
-let audioWs         = null;   // WebSocket to backend audio proxy
-let mediaRecorder   = null;   // MediaRecorder capturing mic
-let audioStream     = null;   // getUserMedia stream handle
+let audioWs              = null;   // WebSocket to backend audio proxy
+let micAudioContext      = null;   // AudioContext for mic capture
+let micSourceNode        = null;   // MediaStreamAudioSourceNode
+let micProcessorNode     = null;   // ScriptProcessorNode (downsamples to 16 kHz)
+let audioStream          = null;   // getUserMedia stream handle (raw tracks)
+let playbackAudioContext = null;   // AudioContext for live streaming PCM16 playback
+let playbackScheduleTime = 0;      // Seconds on the playback clock scheduled so far
+let replayAudioContext   = null;   // AudioContext for replay (kept separate from live stream)
 
 /* ── DOM Elements ─────────────────────────────────────────────────────── */
 const chatViewport     = document.getElementById("chat-viewport");
@@ -184,7 +201,8 @@ function appendUserMessage(text, file = null) {
 
 /**
  * Create an Assistant response card with clean response area and citation section.
- * @returns {{ row: HTMLElement, textContainer: HTMLElement, citationSection: HTMLElement }}
+ *
+ * @returns {{ row: HTMLElement, textContainer: HTMLElement, citationSection: HTMLElement, audioReplayContainer: HTMLElement }}
  */
 function createAssistantCard() {
   const rowEl = document.createElement("div");
@@ -207,15 +225,21 @@ function createAssistantCard() {
   citationSection.className = "citation-section";
   citationSection.style.display = "none";
 
+  // Audio replay toolbar (hidden until audio response completes)
+  const audioReplayContainer = document.createElement("div");
+  audioReplayContainer.className = "audio-replay-bar";
+  audioReplayContainer.style.display = "none";
+
   cardEl.appendChild(textContainer);
   cardEl.appendChild(citationSection);
+  cardEl.appendChild(audioReplayContainer);
 
   rowEl.innerHTML = `<div class="msg-avatar-ai">AI</div>`;
   rowEl.appendChild(cardEl);
   messagesList.appendChild(rowEl);
   scrollToBottom();
 
-  return { row: rowEl, textContainer, citationSection };
+  return { row: rowEl, textContainer, citationSection, audioReplayContainer };
 }
 
 /**
@@ -352,10 +376,13 @@ async function sendMessage(query) {
   appendUserMessage(trimmed, fileToSend);
   clearAttachedFile();
 
-  const { textContainer, citationSection } = createAssistantCard();
+  const { textContainer, citationSection, audioReplayContainer } = createAssistantCard();
+
 
   let tokenBuffer = "";
   let hasReceivedToken = false;
+  let hasAudioOutput = false;
+  const chunkStore = [];  // Accumulates PCM16 chunks for post-stream replay
 
   try {
     abortController = new AbortController();
@@ -412,10 +439,27 @@ async function sendMessage(query) {
           tokenBuffer += eventPayload.token;
           textContainer.innerHTML = renderMarkdown(tokenBuffer) + '<span class="streaming-cursor"></span>';
           scrollToBottom();
+        } else if (evType === "audio_chunk") {
+          // Audio output from a TTS/voice_model node — play it in the browser
+          if (!hasReceivedToken && !hasAudioOutput) {
+            hasReceivedToken = true;
+            hasAudioOutput = true;
+            textContainer.innerHTML = '<p><em>&#127908; Speaking…</em></p>';
+            btnMic.classList.add("speaking");
+          }
+          handleAudioChunk(eventPayload, chunkStore);
         } else if (evType === "complete") {
           const finalResult = eventPayload.final_output?.output || tokenBuffer;
-          textContainer.innerHTML = renderMarkdown(finalResult);
-          updateCitations(citationSection, finalResult, fileToSend);
+          if (!hasAudioOutput) {
+            textContainer.innerHTML = renderMarkdown(finalResult);
+            updateCitations(citationSection, finalResult, fileToSend);
+          } else {
+            textContainer.innerHTML = "";
+          }
+          stopPlayback();
+          if (hasAudioOutput && chunkStore.length > 0) {
+            showAudioReplayButton(audioReplayContainer, chunkStore);
+          }
           scrollToBottom();
         } else if (evType === "error") {
           throw new Error(eventPayload.detail || "Workflow execution encountered an unexpected error.");
@@ -424,7 +468,7 @@ async function sendMessage(query) {
     }
 
     // Clean up cursor if finished cleanly
-    if (tokenBuffer && textContainer.querySelector(".streaming-cursor")) {
+    if (!hasAudioOutput && tokenBuffer && textContainer.querySelector(".streaming-cursor")) {
       textContainer.innerHTML = renderMarkdown(tokenBuffer);
       updateCitations(citationSection, tokenBuffer, fileToSend);
     }
@@ -445,6 +489,7 @@ async function sendMessage(query) {
     isStreaming = false;
     abortController = null;
     updateSendControls();
+    stopPlayback();
     scrollToBottom();
   }
 }
@@ -504,8 +549,220 @@ function resetChat() {
   updateSendControls();
 }
 
-/** Set up mic: use live binary audio streaming on HTTPS, fall back to
- *  browser SpeechRecognition on plain HTTP (where getUserMedia is blocked).
+/** Stop and clean up an active audio capture and playback session. */
+function stopAudioStream() {
+  isListening = false;
+  btnMic.classList.remove("listening");
+  btnMic.classList.remove("speaking");
+  btnMic.title = "Voice Input";
+
+  // Stop ScriptProcessorNode and AudioContext for mic
+  if (micProcessorNode) {
+    try { micProcessorNode.disconnect(); } catch {}
+    micProcessorNode = null;
+  }
+  if (micSourceNode) {
+    try { micSourceNode.disconnect(); } catch {}
+    micSourceNode = null;
+  }
+  if (micAudioContext && micAudioContext.state !== "closed") {
+    try { micAudioContext.close(); } catch {}
+    micAudioContext = null;
+  }
+
+  // Stop raw microphone tracks
+  if (audioStream) {
+    audioStream.getTracks().forEach(t => t.stop());
+    audioStream = null;
+  }
+
+  // Send end sentinel and close upstream WebSocket
+  if (audioWs && audioWs.readyState === WebSocket.OPEN) {
+    try { audioWs.send("__end__"); } catch {}
+    try { audioWs.close(); } catch {}
+  }
+  audioWs = null;
+}
+
+/** Stop the PCM16 live-stream playback pipeline. */
+function stopPlayback() {
+  if (playbackAudioContext && playbackAudioContext.state !== "closed") {
+    try { playbackAudioContext.close(); } catch {}
+    playbackAudioContext = null;
+  }
+  playbackScheduleTime = 0;
+  btnMic.classList.remove("speaking");
+}
+
+/** Stop any active replay AudioContext. */
+function stopReplay() {
+  if (replayAudioContext && replayAudioContext.state !== "closed") {
+    try { replayAudioContext.close(); } catch {}
+    replayAudioContext = null;
+  }
+}
+
+/**
+ * Decode a base64 PCM16 mono chunk, schedule it for seamless live playback,
+ * and optionally push the raw Int16 data into a persistent chunkStore for later replay.
+ *
+ * @param {{ data_b64: string, sample_rate: number }} payload - SSE audio_chunk event
+ * @param {Array<{int16: Int16Array, sample_rate: number}> | null} chunkStore
+ *   If provided, the decoded Int16Array is appended here so the caller can replay later.
+ */
+function handleAudioChunk(payload, chunkStore = null) {
+  const { data_b64, sample_rate = 24000 } = payload;
+  if (!data_b64) return;
+
+  // Decode base64 -> Int16Array
+  const binaryStr = atob(data_b64);
+  const int16 = new Int16Array(binaryStr.length / 2);
+  for (let i = 0; i < int16.length; i++) {
+    int16[i] = (binaryStr.charCodeAt(i * 2) | (binaryStr.charCodeAt(i * 2 + 1) << 8));
+  }
+
+  // Persist chunk for replay if a store was given
+  if (chunkStore !== null) {
+    chunkStore.push({ int16, sample_rate });
+  }
+
+  // ── Live streaming playback ──
+  if (!playbackAudioContext || playbackAudioContext.state === "closed") {
+    playbackAudioContext = new (window.AudioContext || window.webkitAudioContext)({
+      sampleRate: sample_rate,
+    });
+    playbackScheduleTime = playbackAudioContext.currentTime + 0.05;
+    btnMic.classList.add("speaking");
+  }
+
+  const numSamples = int16.length;
+  const audioBuffer = playbackAudioContext.createBuffer(1, numSamples, sample_rate);
+  const channelData = audioBuffer.getChannelData(0);
+  for (let i = 0; i < numSamples; i++) {
+    channelData[i] = int16[i] / 32768.0;
+  }
+
+  const bufferSource = playbackAudioContext.createBufferSource();
+  bufferSource.buffer = audioBuffer;
+  bufferSource.connect(playbackAudioContext.destination);
+
+  const now = playbackAudioContext.currentTime;
+  const startAt = Math.max(now + 0.01, playbackScheduleTime);
+  bufferSource.start(startAt);
+  playbackScheduleTime = startAt + audioBuffer.duration;
+
+  bufferSource.onended = () => {
+    if (playbackAudioContext && playbackScheduleTime <= playbackAudioContext.currentTime + 0.05) {
+      btnMic.classList.remove("speaking");
+    }
+  };
+}
+
+/**
+ * Concatenate all stored PCM16 chunks and play them through a new AudioContext.
+ * Shows a Stop button on the replay bar while playing, then restores Play when done.
+ *
+ * @param {Array<{int16: Int16Array, sample_rate: number}>} chunkStore - Accumulated chunks
+ * @param {HTMLElement} replayBar - The audio-replay-bar element hosting the button
+ */
+function replayAudio(chunkStore, replayBar) {
+  if (!chunkStore || chunkStore.length === 0) return;
+
+  // Stop any previous replay
+  stopReplay();
+
+  const sample_rate = chunkStore[0].sample_rate;
+  const totalSamples = chunkStore.reduce((acc, c) => acc + c.int16.length, 0);
+
+  // Concatenate all Int16 arrays into one Float32 buffer
+  const combined = new Float32Array(totalSamples);
+  let offset = 0;
+  for (const { int16 } of chunkStore) {
+    for (let i = 0; i < int16.length; i++) {
+      combined[offset++] = int16[i] / 32768.0;
+    }
+  }
+
+  replayAudioContext = new (window.AudioContext || window.webkitAudioContext)({
+    sampleRate: sample_rate,
+  });
+
+  const audioBuffer = replayAudioContext.createBuffer(1, totalSamples, sample_rate);
+  audioBuffer.copyToChannel(combined, 0);
+
+  const source = replayAudioContext.createBufferSource();
+  source.buffer = audioBuffer;
+  source.connect(replayAudioContext.destination);
+  source.start(0);
+
+  // Swap to Stop button while playing
+  _setReplayBarState(replayBar, "playing", chunkStore);
+
+  source.onended = () => {
+    stopReplay();
+    _setReplayBarState(replayBar, "idle", chunkStore);
+  };
+}
+
+/**
+ * Render the audio replay bar into the given container.
+ * Called once when audio streaming for a response completes.
+ *
+ * @param {HTMLElement} replayBar - The audio-replay-bar element
+ * @param {Array<{int16: Int16Array, sample_rate: number}>} chunkStore
+ */
+function showAudioReplayButton(replayBar, chunkStore) {
+  assert: typeof replayBar === "object" && replayBar !== null;
+  _setReplayBarState(replayBar, "idle", chunkStore);
+  replayBar.style.display = "flex";
+  scrollToBottom();
+}
+
+/**
+ * Update replay bar button between idle (Play) and playing (Stop) states.
+ *
+ * @param {HTMLElement} replayBar
+ * @param {"idle" | "playing"} state
+ * @param {Array<{int16: Int16Array, sample_rate: number}>} chunkStore
+ */
+function _setReplayBarState(replayBar, state, chunkStore) {
+  if (state === "playing") {
+    replayBar.innerHTML = `
+      <button class="btn-audio-replay btn-audio-replay--playing" title="Stop replay">
+        <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24"
+             fill="currentColor" aria-hidden="true"><rect x="6" y="6" width="12" height="12" rx="2"/></svg>
+        Stop
+      </button>
+      <span class="audio-replay-label">Playing response audio…</span>
+    `;
+    replayBar.querySelector(".btn-audio-replay").addEventListener("click", () => {
+      stopReplay();
+      _setReplayBarState(replayBar, "idle", chunkStore);
+    });
+  } else {
+    const totalSec = chunkStore.reduce((s, c) => s + c.int16.length / c.sample_rate, 0);
+    const durLabel = totalSec >= 60
+      ? `${Math.floor(totalSec / 60)}m ${Math.round(totalSec % 60)}s`
+      : `${totalSec.toFixed(1)}s`;
+    replayBar.innerHTML = `
+      <button class="btn-audio-replay" title="Replay audio response">
+        <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24"
+             fill="currentColor" aria-hidden="true"><polygon points="5,3 19,12 5,21"/></svg>
+        Play Audio
+      </button>
+      <span class="audio-replay-label">Audio response &middot; ${durLabel}</span>
+    `;
+    replayBar.querySelector(".btn-audio-replay").addEventListener("click", () => {
+      replayAudio(chunkStore, replayBar);
+    });
+  }
+}
+
+
+/**
+ * Set up mic capability detection on page load.
+ * Configures SpeechRecognition fallback on plain HTTP, or enables full
+ * PCM16 streaming on HTTPS/localhost.
  */
 function setupAudioStreaming() {
   if (!btnMic) return;
@@ -513,13 +770,10 @@ function setupAudioStreaming() {
     navigator.mediaDevices && navigator.mediaDevices.getUserMedia;
 
   if (hasGetUserMedia) {
-    // HTTPS / localhost — full binary streaming available
-    btnMic.title = "Voice Input (Live Stream)";
+    btnMic.title = "Voice Input (Live Audio Stream)";
     return;
   }
 
-  // Plain HTTP (e.g. http://<IP>:8000) — getUserMedia is blocked by browser.
-  // Fall back to webkitSpeechRecognition so the button still works.
   const SpeechRecognition =
     window.SpeechRecognition || window.webkitSpeechRecognition;
 
@@ -561,36 +815,11 @@ function setupAudioStreaming() {
     btnMic.classList.remove("listening");
     btnMic.title = "Voice Input";
   };
-
-  btnMic.title = "Voice Input (Dictation mode — serve over HTTPS for live audio)";
-}
-
-/** Stop and clean up an active audio stream session. */
-function stopAudioStream() {
-  isListening = false;
-  btnMic.classList.remove("listening");
-  btnMic.title = "Voice Input";
-
-  if (mediaRecorder && mediaRecorder.state !== "inactive") {
-    try { mediaRecorder.stop(); } catch {}
-  }
-  mediaRecorder = null;
-
-  if (audioStream) {
-    audioStream.getTracks().forEach(t => t.stop());
-    audioStream = null;
-  }
-
-  if (audioWs && audioWs.readyState === WebSocket.OPEN) {
-    try { audioWs.send("__end__"); } catch {}
-    try { audioWs.close(); } catch {}
-  }
-  audioWs = null;
 }
 
 /**
  * Toggle live audio streaming mic on/off.
- * On start: get mic → open WS → start MediaRecorder → fire /api/audio/execute.
+ * On start: get mic → open WS → start ScriptProcessorNode → fire /api/audio/execute.
  * On stop: send "__end__" → close WS → stream response into chat like text.
  */
 async function toggleAudioStream() {
@@ -611,7 +840,7 @@ async function toggleAudioStream() {
     return;
   }
 
-  // ── HTTPS / localhost path: full binary streaming ───────────────────────
+  // ── HTTPS / localhost path: full PCM16 binary streaming ─────────────
   if (isListening) {
     stopAudioStream();
     return;
@@ -628,65 +857,83 @@ async function toggleAudioStream() {
   btnMic.classList.add("listening");
   btnMic.title = "Recording… Click to stop and send";
 
-  // Generate unique stream ID
   const streamId = crypto.randomUUID
     ? crypto.randomUUID()
     : `${Date.now()}-${Math.random().toString(36).slice(2)}`;
 
-  // Open WebSocket to backend proxy FIRST
+  // Build the AudioContext at the browser's native sample rate first, then
+  // let the ScriptProcessorNode downsample to MIC_TARGET_SAMPLE_RATE.
+  micAudioContext = new (window.AudioContext || window.webkitAudioContext)();
+  micSourceNode   = micAudioContext.createMediaStreamSource(audioStream);
+
+  // ScriptProcessorNode gives us raw Float32 PCM from the mic
+  micProcessorNode = micAudioContext.createScriptProcessor(
+    MIC_BUFFER_SIZE, 1, 1
+  );
+
+  // Open WebSocket to backend proxy FIRST, before starting the processor
   audioWs = new WebSocket(ENDPOINTS.AUDIO_WS(streamId));
   audioWs.binaryType = "arraybuffer";
 
-  audioWs.onerror = (e) => {
-    console.error("Audio WS error:", e);
+  audioWs.onerror = () => {
     stopAudioStream();
     appendErrorCard("Audio WebSocket connection failed. Is the server running?", "");
   };
 
-  // Wait for WS to open before starting MediaRecorder
+  // Wait for WS to open
   await new Promise((resolve, reject) => {
-    audioWs.onopen = resolve;
+    audioWs.onopen  = resolve;
     audioWs.onerror = reject;
-  }).catch(() => {
-    stopAudioStream();
-    return;
-  });
+  }).catch(() => { stopAudioStream(); return; });
 
   if (!audioWs || audioWs.readyState !== WebSocket.OPEN) return;
 
-  // Set up MediaRecorder — prefer Opus/WebM if supported
-  const mimeType = MediaRecorder.isTypeSupported("audio/webm;codecs=opus")
-    ? "audio/webm;codecs=opus"
-    : "audio/webm";
+  // Compute the integer downsampling ratio (browser rate ÷ target rate)
+  const nativeRate   = micAudioContext.sampleRate;  // e.g. 48000
+  const downsampleRatio = Math.round(nativeRate / MIC_TARGET_SAMPLE_RATE); // e.g. 3
 
-  mediaRecorder = new MediaRecorder(audioStream, { mimeType, timeslice: 250 });
+  micProcessorNode.onaudioprocess = (e) => {
+    if (!audioWs || audioWs.readyState !== WebSocket.OPEN) return;
 
-  mediaRecorder.ondataavailable = (e) => {
-    if (e.data && e.data.size > 0 && audioWs && audioWs.readyState === WebSocket.OPEN) {
-      e.data.arrayBuffer().then(buf => {
-        if (audioWs && audioWs.readyState === WebSocket.OPEN) {
-          audioWs.send(buf);
-        }
-      });
+    const inputFloat32 = e.inputBuffer.getChannelData(0);
+    // Downsample by picking every downsampleRatio-th sample
+    const outLen  = Math.floor(inputFloat32.length / downsampleRatio);
+    const int16   = new Int16Array(outLen);
+    for (let i = 0; i < outLen; i++) {
+      // Clamp to [-1, 1] before converting to Int16
+      const sample = Math.max(-1.0, Math.min(1.0, inputFloat32[i * downsampleRatio]));
+      int16[i] = sample < 0 ? sample * 0x8000 : sample * 0x7FFF;
     }
+    audioWs.send(int16.buffer);
   };
 
-  mediaRecorder.onstop = async () => {
+  micSourceNode.connect(micProcessorNode);
+  // Connect to destination with zero gain so we don't hear our own mic
+  micProcessorNode.connect(micAudioContext.destination);
+
+  // Define the completion handler to be executed by the button toggle logic
+  const onStopRecording = async () => {
+    // Disconnect processor and stop mic
+    try { micProcessorNode.disconnect(); } catch {}
+    try { micSourceNode.disconnect(); } catch {}
+
     // Send end sentinel and close WS
     if (audioWs && audioWs.readyState === WebSocket.OPEN) {
       try { audioWs.send("__end__"); } catch {}
-      setTimeout(() => { try { audioWs.close(); } catch {} }, 300);
+      await new Promise(r => setTimeout(r, 200));
+      try { audioWs.close(); } catch {}
     }
 
-    // Now fire /api/audio/execute — the audio queue is already uploaded
     isStreaming = true;
     updateSendControls();
 
     // Show a placeholder message that voice was sent
     appendUserMessage("🎤 (Voice message sent)", null);
-    const { textContainer, citationSection } = createAssistantCard();
+    const { textContainer, citationSection, audioReplayContainer } = createAssistantCard();
     let tokenBuffer = "";
     let hasReceivedToken = false;
+    let hasAudioOutput = false;
+    const chunkStore = [];  // Accumulates PCM16 chunks for replay
 
     try {
       const form = new FormData();
@@ -695,7 +942,6 @@ async function toggleAudioStream() {
       const response = await fetch(ENDPOINTS.AUDIO_EXECUTE, {
         method: "POST",
         body: form,
-        signal: abortController ? abortController.signal : undefined,
       });
 
       if (!response.ok) {
@@ -725,10 +971,27 @@ async function toggleAudioStream() {
             tokenBuffer += payload.token;
             textContainer.innerHTML = renderMarkdown(tokenBuffer) + '<span class="streaming-cursor"></span>';
             scrollToBottom();
+          } else if (evType === "audio_chunk") {
+            // Voice model response — play audio in browser
+            if (!hasReceivedToken && !hasAudioOutput) {
+              hasReceivedToken = true;
+              hasAudioOutput = true;
+              textContainer.innerHTML = '<p><em>&#127908; Speaking…</em></p>';
+              btnMic.classList.add("speaking");
+            }
+            handleAudioChunk(payload, chunkStore);
           } else if (evType === "complete") {
             const final = payload.final_output?.output || tokenBuffer;
-            textContainer.innerHTML = renderMarkdown(final);
-            updateCitations(citationSection, final, null);
+            if (!hasAudioOutput) {
+              textContainer.innerHTML = renderMarkdown(final);
+              updateCitations(citationSection, final, null);
+            } else {
+              textContainer.innerHTML = "";
+            }
+            stopPlayback();
+            if (hasAudioOutput && chunkStore.length > 0) {
+              showAudioReplayButton(audioReplayContainer, chunkStore);
+            }
             scrollToBottom();
           } else if (evType === "error") {
             throw new Error(payload.detail || "Audio workflow error");
@@ -750,7 +1013,7 @@ async function toggleAudioStream() {
     }
   };
 
-  mediaRecorder.start(250); // emit data every 250ms
+  btnMic._onStopRecording = onStopRecording;
 }
 
 /** Export conversation history to a markdown file. */
@@ -848,9 +1111,19 @@ if (btnRemoveChip) {
   btnRemoveChip.addEventListener("click", clearAttachedFile);
 }
 
-// Voice Mic Button — triggers live audio streaming or speech dictation
+// Voice Mic Button — toggles live PCM16 audio streaming or speech dictation
 if (btnMic) {
-  btnMic.addEventListener("click", toggleAudioStream);
+  btnMic.addEventListener("click", async () => {
+    // If there's a pending stop-and-execute callback, trigger it
+    if (isListening && btnMic._onStopRecording) {
+      const cb = btnMic._onStopRecording;
+      btnMic._onStopRecording = null;
+      stopAudioStream();
+      await cb();
+    } else {
+      await toggleAudioStream();
+    }
+  });
 }
 
 // Web Search Toggle Pill

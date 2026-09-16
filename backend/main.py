@@ -1,13 +1,17 @@
-"""FastAPI backend that runs script.py as a subprocess for each chat message.
+"""FastAPI backend that executes Paradigm Platform workflow scripts as subprocesses.
 
-The script is executed verbatim — the only modification is replacing the
-``"<value>"`` placeholder with the actual user query before each run.
+Credentials (WORKFLOW_KEY, WORKFLOW_ID, BASE_URL) and input/output metadata are
+introspected dynamically from ``script.py`` on every request via
+``script_transformer.inspect_script`` — dropping a new ``script.py`` automatically
+reconfigures the backend without a restart.
 
 Routes
 ------
-POST /api/chat/stream       — run script.py with the query, stream stdout as SSE.
-GET  /api/health-check      — health probe.
-GET  /                      — serves the frontend static files.
+POST /api/chat/stream           — rewrite script.py, run as subprocess, stream SSE.
+POST /api/audio/execute         — fire execute/stream with stream_refs, relay SSE.
+WS   /api/audio/stream/{id}     — proxy mic audio to upstream audio-streams WS.
+GET  /api/health-check          — health probe.
+GET  /                          — serves chatbot.html.
 """
 from __future__ import annotations
 
@@ -29,7 +33,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
-from script_transformer import rewrite_script
+from script_transformer import inspect_script, rewrite_script, ScriptMetadata
 
 app = FastAPI(title="Chat Workflow Backend", version="1.0.0")
 
@@ -44,13 +48,39 @@ app.add_middleware(
 
 _SCRIPT_PATH: str = os.path.join(os.path.dirname(os.path.abspath(__file__)), "script.py")
 
-# In-memory session store mapping frontend clients (IP or hardcoded) to platform session IDs
+# In-memory session store mapping frontend client IPs to platform session IDs
 _SESSIONS: dict[str, str] = {}
 
-# Workflow config pulled from script.py constants (kept in sync)
-_WORKFLOW_KEY = "tq4iL76n_FafgnTW4eUCM4mrnfPYsmJSvmLrNY4EKRc"
-_WORKFLOW_ID  = "21b69fd2-b0bf-4ac8-8ac6-be47c14af0b9"
-_BASE_URL     = "https://map-qa.paradigmit.ai/api/v1/agent-workflows"
+# Fallback audio stream variable name — used when the script does not declare stream_refs
+_AUDIO_STREAM_VAR_FALLBACK: str = "audio_input"
+
+# Stdout marker emitted by script.py to carry the full final_output JSON payload
+# (including base64 audio data) back to the subprocess runner.
+_FINAL_OUTPUT_MARKER: str = "__FINAL_OUTPUT__:"
+
+
+def _get_script_metadata() -> ScriptMetadata:
+    """Read and introspect script.py, returning its embedded metadata.
+
+    Called on every audio request so credentials always reflect the current
+    script.py on disk without needing a server restart.
+
+    Returns
+    -------
+    ScriptMetadata
+        Parsed credentials, variable names, and streaming flags.
+
+    Raises
+    ------
+    FileNotFoundError
+        If script.py does not exist at the expected path.
+    ValueError
+        If the script is missing WORKFLOW_KEY or WORKFLOW_ID.
+    """
+    assert os.path.isfile(_SCRIPT_PATH), f"script.py not found at {_SCRIPT_PATH}"
+    with open(_SCRIPT_PATH, encoding="utf-8") as fh:
+        source = fh.read()
+    return inspect_script(source)
 
 
 # ── Health ────────────────────────────────────────────────────────────────
@@ -148,6 +178,7 @@ def _run_script_and_stream(query: str, client_id: str, uploaded_file_path: str |
         )
 
         full_output: list[str] = []
+        final_output_payload: dict[str, Any] | None = None
         stdout_fd = process.stdout.fileno()
 
         # Read stdout in real time — os.read returns whatever bytes are
@@ -158,13 +189,33 @@ def _run_script_and_stream(query: str, client_id: str, uploaded_file_path: str |
                 break
             text = data.decode("utf-8", errors="replace")
             full_output.append(text)
-            
-            # The script is printing raw tokens to stdout if it's streaming.
-            yield _build_sse_line({"event": "token", "token": text})
+
+            # Detect structured __FINAL_OUTPUT__:<json> marker lines and
+            # capture the payload without forwarding it as a token.
+            filtered_lines: list[str] = []
+            for segment in text.splitlines(keepends=True):
+                stripped = segment.strip()
+                if stripped.startswith(_FINAL_OUTPUT_MARKER):
+                    try:
+                        json_part = stripped[len(_FINAL_OUTPUT_MARKER):]
+                        final_output_payload = json.loads(json_part)
+                    except Exception:
+                        pass  # malformed marker — ignore
+                else:
+                    filtered_lines.append(segment)
+
+            visible_text = "".join(filtered_lines)
+            if visible_text:
+                yield _build_sse_line({"event": "token", "token": visible_text})
 
         process.wait()
 
         output_text = "".join(full_output).strip()
+        # Strip marker lines from the human-readable output_text
+        output_text = "\n".join(
+            line for line in output_text.splitlines()
+            if not line.strip().startswith(_FINAL_OUTPUT_MARKER)
+        ).strip()
 
         if process.returncode != 0:
             stderr_text = process.stderr.read().decode("utf-8", errors="replace")
@@ -173,14 +224,19 @@ def _run_script_and_stream(query: str, client_id: str, uploaded_file_path: str |
                 "detail": stderr_text or f"Script exited with code {process.returncode}",
             })
         else:
-            # We attempt to extract the platform session ID if it was printed or if it was captured
-            # In the AST rewritten script, we don't explicitly print the session_id unless we parse it.
-            # But the script might print the final output. For simplicity, we just return what we captured.
-            yield _build_sse_line({
+            # Build the complete event payload.  If the script emitted a
+            # __FINAL_OUTPUT__ marker, include all those fields (audio base64,
+            # mimetype, URLs, etc.) so the frontend can play the audio.
+            complete_payload: dict[str, Any] = {
                 "event": "complete",
                 "status": "success",
                 "final_output": {"output": output_text},
-            })
+            }
+            if final_output_payload is not None:
+                # Merge the rich payload: keep "output" as text fallback
+                # but add all audio and metadata fields.
+                complete_payload["final_output"].update(final_output_payload)
+            yield _build_sse_line(complete_payload)
 
         yield "data: [DONE]\n\n"
 
@@ -215,8 +271,38 @@ async def audio_stream_proxy(websocket: WebSocket, stream_id: str) -> None:
         UUID generated by the browser; ties this audio queue to a workflow
         execution via stream_refs.
     """
-    upstream_url = f"{_BASE_URL.replace('https://', 'wss://').replace('http://', 'ws://')}/audio-streams/{stream_id}"
-    auth_headers = {"X-Workflow-Key": _WORKFLOW_KEY}
+    meta = _get_script_metadata()
+    base_url = meta.base_url
+    assert base_url, "BASE_URL not found in script.py — cannot proxy audio WebSocket"
+
+    # Obtain or create a session so we can pass session_id in the WS handshake.
+    # The upstream audio-streams endpoint requires both workflow_id and session_id
+    # as query parameters when authenticating with X-Workflow-Key.
+    client_id = str(websocket.client.host) if websocket.client else "default"
+    session_id = _SESSIONS.get(client_id)
+    if not session_id:
+        try:
+            sess_resp = requests.post(
+                f"{base_url}/sessions",
+                json={"workflow_id": meta.workflow_id, "name": "Audio session"},
+                headers={"X-Workflow-Key": meta.workflow_key},
+                timeout=15,
+            )
+            sess_resp.raise_for_status()
+            session_id = sess_resp.json()["session_id"]
+            _SESSIONS[client_id] = session_id
+        except Exception as exc:
+            await websocket.accept()
+            await websocket.send_text(json.dumps({"event": "error", "detail": f"Session creation failed: {exc}"}))
+            await websocket.close()
+            return
+
+    upstream_url = (
+        f"{base_url.replace('https://', 'wss://').replace('http://', 'ws://')}"
+        f"/audio-streams/{stream_id}"
+        f"?workflow_id={meta.workflow_id}&session_id={session_id}"
+    )
+    auth_headers = {"X-Workflow-Key": meta.workflow_key}
 
     await websocket.accept()
     try:
@@ -314,37 +400,44 @@ def _run_audio_and_stream(stream_id: str, client_id: str):
         SSE-formatted event lines.
     """
     try:
-        # Step 1: Obtain or reuse session
+        # Step 1: Introspect script.py for dynamic credentials and stream var name
+        meta = _get_script_metadata()
+        assert meta.base_url, "BASE_URL not found in script.py"
+
+        # Step 2: Obtain or reuse session
         session_id = _SESSIONS.get(client_id)
         if not session_id:
             sess_resp = requests.post(
-                f"{_BASE_URL}/sessions",
-                json={"workflow_id": _WORKFLOW_ID, "name": "Audio session"},
-                headers={"X-Workflow-Key": _WORKFLOW_KEY},
+                f"{meta.base_url}/sessions",
+                json={"workflow_id": meta.workflow_id, "name": "Audio session"},
+                headers={"X-Workflow-Key": meta.workflow_key},
                 timeout=15,
             )
             sess_resp.raise_for_status()
             session_id = sess_resp.json()["session_id"]
             _SESSIONS[client_id] = session_id
 
-        # Step 2: Fire execute/stream with stream_refs
-        # stream_refs maps the workflow's audio_stream variable name to the live queue.
-        # The variable name on the Start node must match — adjust if needed.
+        # Step 3: Determine the audio stream variable name from the script.
+        # Falls back to the well-known default if the script has no stream_refs.
+        stream_var_name: str = meta.audio_stream_var_name or _AUDIO_STREAM_VAR_FALLBACK
+
+        # Step 4: Fire execute/stream with stream_refs pointing at the live audio queue
         resp = requests.post(
-            f"{_BASE_URL}/execute/stream",
+            f"{meta.base_url}/execute/stream",
             data={
                 "inputs": json.dumps({}),
-                "stream_refs": json.dumps({"audio_input": stream_id}),
-                "workflow_id": _WORKFLOW_ID,
+                "stream_refs": json.dumps({stream_var_name: stream_id}),
+                "workflow_id": meta.workflow_id,
                 "session_id": session_id,
             },
-            headers={"X-Workflow-Key": _WORKFLOW_KEY},
+            headers={"X-Workflow-Key": meta.workflow_key},
             stream=True,
             timeout=120,
         )
         resp.raise_for_status()
 
-        # Step 3: Relay SSE events from upstream to browser
+        # Step 5: Relay SSE events from upstream to browser.
+        # Handles both text (token) and audio (audio_chunk) output workflows.
         token_buffer: list[str] = []
         for raw_line in resp.iter_lines():
             if not raw_line:
@@ -363,9 +456,26 @@ def _run_audio_and_stream(stream_id: str, client_id: str):
             elif ev == "token":
                 token_buffer.append(event.get("token", ""))
                 yield _build_sse_line({"event": "token", "token": event.get("token", "")})
+            elif ev == "audio_chunk":
+                # Forward audio chunk with its base64 PCM16 payload and sample rate
+                yield _build_sse_line({
+                    "event": "audio_chunk",
+                    "data_b64": event.get("data_b64", ""),
+                    "sample_rate": event.get("sample_rate", 24000),
+                    "node_id": event.get("node_id", ""),
+                })
             elif ev == "complete":
-                final = event.get("final_output", {}).get("output") or "".join(token_buffer)
-                yield _build_sse_line({"event": "complete", "status": "success", "final_output": {"output": final}})
+                final_output = event.get("final_output", {})
+                # Include the full final_output from upstream so the frontend
+                # receives audio_file_output_b64, mimetype, and URLs if present.
+                text_fallback = final_output.get("output") or "".join(token_buffer)
+                complete_payload = final_output.copy()
+                complete_payload.setdefault("output", text_fallback)
+                yield _build_sse_line({
+                    "event": "complete",
+                    "status": "success",
+                    "final_output": complete_payload,
+                })
             elif ev == "error":
                 yield _build_sse_line({"event": "error", "detail": event.get("detail", "Audio workflow error")})
 

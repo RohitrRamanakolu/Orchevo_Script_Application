@@ -979,3 +979,104 @@ body {
     padding: 0 12px 12px 12px;
   }
 }
+
+/* ── Mic Button Audio State Indicators ──────────────────────────────────── */
+
+/* Recording / listening — pulsing red ring */
+.btn-mic.listening {
+  background: #fef2f2 !important;
+  border-color: #ef4444 !important;
+  color: #dc2626 !important;
+  box-shadow: 0 0 0 4px rgba(239, 68, 68, 0.18);
+  animation: mic-pulse 1.1s ease-in-out infinite;
+}
+
+@keyframes mic-pulse {
+  0%, 100% { box-shadow: 0 0 0 4px rgba(239, 68, 68, 0.18); }
+  50%       { box-shadow: 0 0 0 8px rgba(239, 68, 68, 0.08); }
+}
+
+/* Speaking / playing audio back — animated green sound wave */
+.btn-mic.speaking {
+  background: var(--accent-green-light) !important;
+  border-color: var(--accent-green) !important;
+  color: var(--accent-green) !important;
+  box-shadow: 0 0 0 4px rgba(16, 185, 129, 0.18);
+  animation: speaking-wave 1.4s ease-in-out infinite;
+}
+
+@keyframes speaking-wave {
+  0%, 100% { box-shadow: 0 0 0 4px rgba(16, 185, 129, 0.18); transform: scale(1); }
+  50%       { box-shadow: 0 0 0 9px rgba(16, 185, 129, 0.08); transform: scale(1.06); }
+}
+
+/* ── Audio Replay Bar ───────────────────────────────────────────────────── */
+
+/**
+ * Appears at the bottom of an AI card when the response was audio-only.
+ * Shows a Play / Stop button + duration label.
+ */
+.audio-replay-bar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 12px;
+  padding: 8px 12px;
+  background: var(--primary-light);
+  border: 1px solid rgba(70, 72, 212, 0.18);
+  border-radius: var(--radius-md);
+}
+
+.btn-audio-replay {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 14px;
+  border-radius: var(--radius-full);
+  border: 1.5px solid var(--primary);
+  background: var(--primary);
+  color: #fff;
+  font-size: 13px;
+  font-weight: 600;
+  font-family: var(--font-body);
+  cursor: pointer;
+  transition: background 0.15s, transform 0.1s, box-shadow 0.15s;
+  white-space: nowrap;
+}
+
+.btn-audio-replay:hover {
+  background: var(--primary-hover);
+  border-color: var(--primary-hover);
+  transform: translateY(-1px);
+  box-shadow: 0 3px 10px rgba(70, 72, 212, 0.25);
+}
+
+.btn-audio-replay:active {
+  transform: translateY(0);
+  box-shadow: none;
+}
+
+/* Stop / playing variant */
+.btn-audio-replay--playing {
+  background: var(--accent-rose);
+  border-color: var(--accent-rose);
+  animation: replay-pulse 1.2s ease-in-out infinite;
+}
+
+.btn-audio-replay--playing:hover {
+  background: #dc2626;
+  border-color: #dc2626;
+}
+
+@keyframes replay-pulse {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(239, 68, 68, 0.2); }
+  50%       { box-shadow: 0 0 0 5px rgba(239, 68, 68, 0); }
+}
+
+.audio-replay-label {
+  font-size: 12px;
+  color: var(--text-secondary);
+  font-weight: 500;
+}
+
+
