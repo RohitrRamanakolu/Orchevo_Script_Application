@@ -63,8 +63,61 @@ _SESSIONS: dict[str, str] = {}
 # (including base64 audio data) back to the subprocess runner.
 _FINAL_OUTPUT_MARKER: str = "__FINAL_OUTPUT__:"
 
+# Byte size for each non-blocking stdout read. Large __FINAL_OUTPUT__ lines
+# (base64 audio) routinely exceed this, so the reader must reassemble across reads.
+_STDOUT_READ_SIZE: int = 4096
+
 # Max characters of an upstream error body to include in raised exceptions.
 _UPSTREAM_ERROR_BODY_LIMIT: int = 500
+
+
+def _parse_final_output_marker_line(stripped_line: str) -> dict[str, Any] | None:
+    """Parse a complete ``__FINAL_OUTPUT__:<json>`` line into a dict.
+
+    Parameters
+    ----------
+    stripped_line:
+        One stdout line with leading/trailing whitespace already removed.
+        Must start with ``_FINAL_OUTPUT_MARKER``.
+
+    Returns
+    -------
+    dict[str, Any] | None
+        Parsed JSON object, or ``None`` when the JSON is not yet valid.
+
+    Raises
+    ------
+    AssertionError
+        If ``stripped_line`` does not start with the marker.
+    """
+    assert isinstance(stripped_line, str), "stripped_line must be a string"
+    assert stripped_line.startswith(_FINAL_OUTPUT_MARKER), (
+        f"Expected marker prefix {_FINAL_OUTPUT_MARKER!r}, got {stripped_line[:40]!r}"
+    )
+    json_part = stripped_line[len(_FINAL_OUTPUT_MARKER) :]
+    try:
+        payload = json.loads(json_part)
+    except json.JSONDecodeError:
+        return None
+    assert isinstance(payload, dict), (
+        f"__FINAL_OUTPUT__ payload must be a JSON object, got {type(payload).__name__}"
+    )
+    return payload
+
+
+def _is_final_output_line_prefix(text: str) -> bool:
+    """Return True if ``text`` is a full or incomplete ``__FINAL_OUTPUT__`` line.
+
+    Used to hold partial stdout across ``os.read`` boundaries so base64 audio
+    is never forwarded as SSE token events.
+    """
+    assert isinstance(text, str), "text must be a string"
+    stripped = text.lstrip()
+    if not stripped:
+        return False
+    if stripped.startswith(_FINAL_OUTPUT_MARKER):
+        return True
+    return _FINAL_OUTPUT_MARKER.startswith(stripped)
 
 
 def _get_script_metadata() -> ScriptMetadata:
@@ -179,7 +232,10 @@ def _files_map_for_upload(meta: ScriptMetadata, uploaded_file_path: str) -> dict
             "An uploaded file was provided, but script.py declares no "
             "files={...} multipart variables to bind it to."
         )
-    return {meta.file_var_names[0]: uploaded_file_path}
+    # Prefer stream/input Start vars over TTS output names (same ranking as live mic).
+    bind_name = resolve_audio_stream_var_name(meta)
+    assert isinstance(bind_name, str) and bind_name, "bind_name must be non-empty"
+    return {bind_name: uploaded_file_path}
 
 
 def _run_script_and_stream(query: str, client_id: str, uploaded_file_path: str | None = None):
@@ -203,8 +259,11 @@ def _run_script_and_stream(query: str, client_id: str, uploaded_file_path: str |
     str
         SSE-formatted text lines.
     """
-    assert isinstance(query, str) and len(query) > 0, "Query must be non-empty"
+    assert isinstance(query, str), "Query must be a string"
     assert os.path.isfile(_SCRIPT_PATH), f"script.py not found at {_SCRIPT_PATH}"
+    has_upload = isinstance(uploaded_file_path, str) and bool(uploaded_file_path)
+    if not query.strip() and not has_upload:
+        raise ValueError("Provide a text query and/or an uploaded audio/file")
 
     tmp_path: str | None = None
     try:
@@ -213,35 +272,37 @@ def _run_script_and_stream(query: str, client_id: str, uploaded_file_path: str |
             source = fh.read()
 
         meta = inspect_script(source)
-        if meta.file_var_names and not uploaded_file_path:
-            raise ValueError(
-                f"This workflow requires a file upload for variable(s) "
-                f"{meta.file_var_names}; attach a file before sending chat text."
-            )
+        # Dual-input: text query (omit files=) OR mic WAV upload bound to the
+        # multipart Start var discovered from script.py (empty query → STT).
 
         active_session_id = _SESSIONS.get(client_id)
         files_map: dict[str, str] | None = None
-        if uploaded_file_path:
+        if has_upload:
+            assert uploaded_file_path is not None
             files_map = _files_map_for_upload(meta, uploaded_file_path)
 
         # Rewrite the script with AST to inject inputs, files, and session
         modified_source = rewrite_script(
             script_source=source,
-            query=query,
+            query=query.strip(),
             session_id=active_session_id,
             files=files_map,
         )
 
-        # ── Write to a temp file next to script.py ────────────────────
+        # Write outside the backend package dir. With ``uvicorn --reload``,
+        # a temp ``.py`` next to ``main.py`` triggers WatchFiles, which
+        # restarts the server and raises KeyboardInterrupt in the subprocess.
         with tempfile.NamedTemporaryFile(
             mode="w",
             suffix=".py",
             delete=False,
             encoding="utf-8",
-            dir=os.path.dirname(_SCRIPT_PATH),
+            dir=tempfile.gettempdir(),
         ) as tmp:
             tmp.write(modified_source)
             tmp_path = tmp.name
+            assert isinstance(tmp_path, str) and len(tmp_path) > 0
+            assert os.path.isfile(tmp_path), f"Temp script missing after write: {tmp_path}"
 
         # ── Run the script ────────────────────────────────────────────
         env = os.environ.copy()
@@ -257,33 +318,55 @@ def _run_script_and_stream(query: str, client_id: str, uploaded_file_path: str |
         full_output: list[str] = []
         final_output_payload: dict[str, Any] | None = None
         stdout_fd = process.stdout.fileno()
+        # Incomplete last line held across reads so a multi-chunk
+        # __FINAL_OUTPUT__:<json> is never split into token events.
+        stdout_carry: str = ""
 
         # Read stdout in real time — os.read returns whatever bytes are
         # available without waiting to fill the buffer.
         while True:
-            data = os.read(stdout_fd, 4096)
+            data = os.read(stdout_fd, _STDOUT_READ_SIZE)
             if not data:
                 break
             text = data.decode("utf-8", errors="replace")
             full_output.append(text)
+            stdout_carry += text
 
-            # Detect structured __FINAL_OUTPUT__:<json> marker lines and
-            # capture the payload without forwarding it as a token.
-            filtered_lines: list[str] = []
-            for segment in text.splitlines(keepends=True):
-                stripped = segment.strip()
+            visible_parts: list[str] = []
+            while True:
+                newline_at = stdout_carry.find("\n")
+                if newline_at < 0:
+                    break
+                line = stdout_carry[: newline_at + 1]
+                stdout_carry = stdout_carry[newline_at + 1 :]
+                stripped = line.strip()
                 if stripped.startswith(_FINAL_OUTPUT_MARKER):
-                    try:
-                        json_part = stripped[len(_FINAL_OUTPUT_MARKER):]
-                        final_output_payload = json.loads(json_part)
-                    except Exception:
-                        pass  # malformed marker — ignore
+                    parsed = _parse_final_output_marker_line(stripped)
+                    if parsed is not None:
+                        final_output_payload = parsed
                 else:
-                    filtered_lines.append(segment)
+                    visible_parts.append(line)
 
-            visible_text = "".join(filtered_lines)
+            # Flush partial text only when it cannot be a FINAL_OUTPUT line.
+            # Hold prefixes of the marker and any line that already started
+            # with the marker until the terminating newline arrives.
+            if stdout_carry and not _is_final_output_line_prefix(stdout_carry):
+                visible_parts.append(stdout_carry)
+                stdout_carry = ""
+
+            visible_text = "".join(visible_parts)
             if visible_text:
                 yield _build_sse_line({"event": "token", "token": visible_text})
+
+        # EOF: resolve any trailing line that never received a newline.
+        if stdout_carry:
+            stripped = stdout_carry.strip()
+            if stripped.startswith(_FINAL_OUTPUT_MARKER):
+                parsed = _parse_final_output_marker_line(stripped)
+                if parsed is not None:
+                    final_output_payload = parsed
+            elif stripped:
+                yield _build_sse_line({"event": "token", "token": stdout_carry})
 
         process.wait()
 
@@ -570,21 +653,34 @@ def _run_audio_and_stream(stream_id: str, client_id: str):
 @app.post(f"{_API_PREFIX}/api/chat/stream")
 async def chat_stream(
     request: Request,
-    query: str = Form(...),
+    query: str = Form(default=""),
     file: UploadFile | None = File(default=None),
 ) -> StreamingResponse:
-    """Run script.py with the given query and stream the result."""
-    assert isinstance(query, str) and len(query) > 0, "Query must be non-empty"
-    
-    # Use client IP as a crude session identifier for single-user scenarios
+    """Run script.py with text and/or an uploaded audio file; stream SSE.
+
+    Dual-input turns
+    ----------------
+    * Text: non-empty ``query``, optional document attach.
+    * Voice file: empty ``query`` + audio ``file`` (mic recording as WAV) bound
+      to the multipart Start variable name discovered from ``script.py``.
+    """
+    assert isinstance(query, str), "query must be a string"
+
     client_id = request.client.host if request.client else "default"
-    
-    uploaded_path = None
-    if file and file.filename:
-        # Save uploaded file to temp path
-        with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(file.filename)[1]) as f:
-            f.write(await file.read())
-            uploaded_path = f.name
+
+    uploaded_path: str | None = None
+    if file is not None and file.filename:
+        suffix = os.path.splitext(file.filename)[1] or ".wav"
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+            body = await file.read()
+            assert isinstance(body, (bytes, bytearray)), "upload body must be bytes"
+            if len(body) == 0:
+                raise ValueError("Uploaded audio/file is empty")
+            tmp.write(body)
+            uploaded_path = tmp.name
+
+    if not query.strip() and uploaded_path is None:
+        raise ValueError("Provide a text query and/or an uploaded audio/file")
 
     return StreamingResponse(
         _run_script_and_stream(query, client_id, uploaded_path),

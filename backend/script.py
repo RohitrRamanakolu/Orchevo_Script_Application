@@ -1,7 +1,7 @@
 import requests, json
 
-WORKFLOW_KEY = "EllLSMeNIzI7iuJZuoFqXtK0jMoz6vT_fnOcl1Z7f4s"
-WORKFLOW_ID  = "fa925eb6-7a4e-4c0d-97b1-94f7370c69d8"
+WORKFLOW_KEY = "QXzcrc87z302Q9_rf0j_NnnrRGoFyC54QlIMK_Ef8EA"
+WORKFLOW_ID  = "d9bbbd15-fb8b-432f-b418-754fb6a08ebd"
 BASE_URL     = "https://map-qa.paradigmit.ai/api/v1/agent-workflows"  # change if calling a different environment
 
 # ── Step 1: Create a session (once per conversation) ──────────────────────
@@ -15,20 +15,46 @@ session_resp = requests.post(
 session_resp.raise_for_status()
 session_id = session_resp.json()["session_id"]
 
-# ── Step 2: Execute with file ─────────────────────────────────────────────
+# ── Step 2: Execute ───────────────────────────────────────────────────────
 inputs = {}
-with open("your_file.wav", "rb") as query_f:
-    resp = requests.post(
-        f"{BASE_URL}/execute/stream",
-        data={
-            "inputs": json.dumps(inputs),
-            "workflow_id": WORKFLOW_ID,
-            "session_id": session_id,
-        },
-        files={"query": query_f},
-        headers={"X-Workflow-Key": WORKFLOW_KEY},
-        stream=True,
-    )
+resp = requests.post(
+    f"{BASE_URL}/execute/stream",
+    data={
+        "inputs": json.dumps(inputs),
+        "workflow_id": WORKFLOW_ID,
+        "session_id": session_id,
+    },
+    headers={"X-Workflow-Key": WORKFLOW_KEY},
+    stream=True,
+)
+
+# Optional: attach a file for variable 'audio_file_output'
+# with open("your_file.wav", "rb") as audio_file_output_f:
+#     resp = requests.post(
+#         f"{BASE_URL}/execute/stream",
+#         data={
+#             "inputs": json.dumps(inputs),
+#             "workflow_id": WORKFLOW_ID,
+#             "session_id": session_id,
+#         },
+#         files={"audio_file_output": audio_file_output_f},
+#         headers={"X-Workflow-Key": WORKFLOW_KEY},
+#         stream=True,
+#     )
+
+# Optional: attach a file for variable 'audio_input_stream'
+# with open("your_file.wav", "rb") as audio_input_stream_f:
+#     resp = requests.post(
+#         f"{BASE_URL}/execute/stream",
+#         data={
+#             "inputs": json.dumps(inputs),
+#             "workflow_id": WORKFLOW_ID,
+#             "session_id": session_id,
+#         },
+#         files={"audio_input_stream": audio_input_stream_f},
+#         headers={"X-Workflow-Key": WORKFLOW_KEY},
+#         stream=True,
+#     )
 resp.raise_for_status()
 
 # ── Step 3: Read the SSE stream ────────────────────────────────────────────

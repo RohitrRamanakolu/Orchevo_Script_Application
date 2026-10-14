@@ -225,7 +225,7 @@ body {
   display: flex;
   flex-direction: column;
   align-items: center;
-  padding: 32px 20px 180px 20px;
+  padding: 32px 20px 190px 20px;
   scroll-behavior: smooth;
 }
 
@@ -689,6 +689,22 @@ body {
   gap: 8px;
 }
 
+.live-transcript {
+  min-height: 1.2em;
+  width: 100%;
+  text-align: center;
+  font-size: 13px;
+  line-height: 1.4;
+  color: var(--text-secondary);
+  padding: 0 8px;
+  opacity: 0;
+  transition: opacity 0.2s ease;
+}
+
+.live-transcript.visible {
+  opacity: 1;
+}
+
 /* File Preview Tray */
 .file-preview-tray {
   display: none;
@@ -847,7 +863,7 @@ body {
   gap: 8px;
 }
 
-/* Voice Dictation Mic */
+/* Voice mic */
 .btn-mic {
   width: 36px;
   height: 36px;
@@ -863,9 +879,14 @@ body {
   font-size: 16px;
 }
 
-.btn-mic:hover {
+.btn-mic:hover:not(:disabled) {
   background: #e2e8f0;
   color: var(--text-primary);
+}
+
+.btn-mic:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
 }
 
 .btn-mic.listening {
@@ -966,7 +987,7 @@ body {
     display: none;
   }
   .chat-viewport {
-    padding: 20px 12px 170px 12px;
+    padding: 20px 12px 190px 12px;
   }
   .msg-bubble-user {
     max-width: 88%;
@@ -982,7 +1003,6 @@ body {
 
 /* ── Mic Button Audio State Indicators ──────────────────────────────────── */
 
-/* Recording / listening — pulsing red ring */
 .btn-mic.listening {
   background: #fef2f2 !important;
   border-color: #ef4444 !important;
@@ -996,7 +1016,6 @@ body {
   50%       { box-shadow: 0 0 0 8px rgba(239, 68, 68, 0.08); }
 }
 
-/* Speaking / playing audio back — animated green sound wave */
 .btn-mic.speaking {
   background: var(--accent-green-light) !important;
   border-color: var(--accent-green) !important;

@@ -1,16 +1,15 @@
 /**
  * Odisha Govt Chatbot Client
- * Handles conversational streaming with SSE, voice dictation, file attachments,
- * markdown parsing, thinking accordion, and bidirectional audio streaming.
+ * Dual input:
+ *   - Text (+ optional attach) via /odisha/api/chat/stream
+ *   - Mic: live 16 kHz PCM over WebSocket + /odisha/api/audio/execute
+ *     (stream_refs → audio_stream Start var from script.py, e.g. audio_input_stream)
+ * SpeechRecognition shows a live user transcript; SSE relays text/audio replies.
  *
  * Audio Architecture:
- * - INPUT:  Web Audio API ScriptProcessorNode downsamples microphone to 16 kHz
- *           mono Int16 PCM and streams binary chunks over WebSocket.
- * - OUTPUT (streamed): SSE audio_chunk events (base64 PCM16 @ sample_rate) are
- *           decoded and played seamlessly via a scheduled Web Audio API buffer
- *           queue at the chunk's native sample rate (usually 24 kHz).
- * - OUTPUT (file):    SSE complete.final_output.audio_file_output_b64 (WAV/MP3
- *           base64) is decoded to a Blob, auto-played, and offered for replay.
+ * - INPUT (mic): ScriptProcessorNode → PCM16 @ 16 kHz → WS audio/stream/{id}
+ * - OUTPUT (streamed): SSE audio_chunk events (base64 PCM16 @ sample_rate)
+ * - OUTPUT (file):    audio_file_output_b64 / audio_file_output_public_url
  */
 
 /* ── Constants ────────────────────────────────────────────────────────── */
@@ -25,12 +24,22 @@ const ENDPOINTS = Object.freeze({
   HEALTH:         `${API_BASE}${API_PREFIX}/api/health-check`,
 });
 
-/** Target input sample rate required by Paradigm Platform voice/gemini-live nodes. */
+/** Mic / live-stream sample rate required by Paradigm audio_stream STT. */
 const MIC_TARGET_SAMPLE_RATE = 16000;
 /** ScriptProcessorNode buffer size — must be a power of two; 4096 ≈ 256 ms at 16 kHz. */
 const MIC_BUFFER_SIZE = 4096;
 /** Fallback MIME when complete.final_output.mimetype is absent (Paradigm WAV files). */
 const DEFAULT_AUDIO_FILE_MIMETYPE = "audio/wav";
+/** Browser SpeechRecognition language for on-device user transcript display. */
+const USER_TRANSCRIPT_LANG = "en-IN";
+/** Idle / status copy shown under the mic. */
+const VOICE_STATUS = Object.freeze({
+  IDLE:       "Tap the microphone to speak",
+  LISTENING:  "Listening… tap mic or Send to submit",
+  PROCESSING: "Thinking…",
+  SPEAKING:   "Speaking…",
+  UNAVAILABLE:"Voice input unavailable (need HTTPS or Chrome/Edge)",
+});
 
 const AUTO_SCROLL_THRESHOLD_PX = 140;
 const MAX_TEXTAREA_HEIGHT_PX   = 160;
@@ -39,11 +48,9 @@ const MAX_TEXTAREA_HEIGHT_PX   = 160;
 let isStreaming     = false;
 let abortController = null;
 let attachedFile    = null;
-let speechRecognizer = null;
 let isListening     = false;
-let isWebSearchOn   = false;
 
-// Audio streaming state
+// Live mic streaming state (PCM16 → WebSocket → stream_refs)
 let audioWs              = null;   // WebSocket to backend audio proxy
 let micAudioContext      = null;   // AudioContext for mic capture
 let micSourceNode        = null;   // MediaStreamAudioSourceNode
@@ -53,6 +60,9 @@ let playbackAudioContext = null;   // AudioContext for live streaming PCM16 play
 let playbackScheduleTime = 0;      // Seconds on the playback clock scheduled so far
 let replayAudioContext   = null;   // AudioContext for replay (kept separate from live stream)
 let fileReplayAudio      = null;   // HTMLAudioElement for audio_file_output_b64 replay
+let userSpeechRecognizer = null;   // Parallel SpeechRecognition for user transcript
+let transcriptFinalParts = [];     // Finalized SpeechRecognition segments
+let transcriptInterim    = "";     // Current interim SpeechRecognition segment
 
 /* ── DOM Elements ─────────────────────────────────────────────────────── */
 const chatViewport     = document.getElementById("chat-viewport");
@@ -67,10 +77,10 @@ const chipFileName     = document.getElementById("chip-file-name");
 const chipFileSize     = document.getElementById("chip-file-size");
 const btnRemoveChip    = document.getElementById("btn-remove-chip");
 const btnMic           = document.getElementById("btn-mic");
-const btnWebSearch     = document.getElementById("btn-web-search");
+const voiceStatusEl    = document.getElementById("voice-status");
+const liveTranscriptEl = document.getElementById("live-transcript");
 const btnNewChat       = document.getElementById("btn-new-chat");
 const btnExportChat    = document.getElementById("btn-export-chat");
-const modelSelect      = document.getElementById("model-select");
 
 /* ── Markdown & Formatting ────────────────────────────────────────────── */
 
@@ -369,19 +379,31 @@ window.retryQuery = function(encodedQuery) {
 /* ── Streaming Engine ─────────────────────────────────────────────────── */
 
 /**
- * Stream conversational message from the backend.
- * @param {string} query 
+ * Stream a chat/voice turn from the backend.
+ * @param {string} query  Text prompt; may be empty when ``fileOverride`` is set (mic WAV).
+ * @param {File | null} [fileOverride]  Optional file to send instead of ``attachedFile``.
+ * @param {string} [displayOverride]  Bubble label when query is empty (voice turns).
  */
-async function sendMessage(query) {
-  const trimmed = query.trim();
-  if (isStreaming || !trimmed) return;
+async function sendMessage(query, fileOverride, displayOverride) {
+  const trimmed = typeof query === "string" ? query.trim() : "";
+  const fileToSend =
+    fileOverride instanceof File ? fileOverride : attachedFile;
+  if (isStreaming) return;
+  if (!trimmed && !(fileToSend instanceof File)) return;
 
   isStreaming = true;
   updateSendControls();
 
-  const fileToSend = attachedFile;
-  appendUserMessage(trimmed, fileToSend);
-  clearAttachedFile();
+  const displayText =
+    (typeof displayOverride === "string" && displayOverride.trim().length > 0)
+      ? displayOverride.trim()
+      : (trimmed.length > 0
+        ? trimmed
+        : (fileToSend && fileToSend.name) || "Voice message");
+  appendUserMessage(displayText, fileToSend);
+  if (!(fileOverride instanceof File)) {
+    clearAttachedFile();
+  }
 
   const { textContainer, citationSection, audioReplayContainer } = createAssistantCard();
 
@@ -396,8 +418,8 @@ async function sendMessage(query) {
 
     const form = new FormData();
     form.append("query", trimmed);
-    if (fileToSend) {
-      form.append("file", fileToSend);
+    if (fileToSend instanceof File) {
+      form.append("file", fileToSend, fileToSend.name || "upload.bin");
     }
 
     const response = await fetch(ENDPOINTS.CHAT_STREAM, {
@@ -466,10 +488,7 @@ async function sendMessage(query) {
           if (hasAudioOutput && chunkStore.length > 0) {
             textContainer.innerHTML = "";
             showAudioReplayButton(audioReplayContainer, chunkStore);
-          } else if (
-            typeof fo.audio_file_output_b64 === "string" &&
-            fo.audio_file_output_b64.length > 0
-          ) {
+          } else if (hasAudioFileResponse(fo)) {
             if (finalResult) {
               textContainer.innerHTML = renderMarkdown(finalResult);
               updateCitations(citationSection, finalResult, fileToSend);
@@ -534,31 +553,146 @@ function scrollToBottom() {
   }
 }
 
-/** Update send button state (send vs stop). */
+/**
+ * Update send / mic affordances while a response stream is in flight.
+ */
 function updateSendControls() {
-  if (isStreaming) {
-    btnSend.innerHTML = "■";
-    btnSend.classList.add("streaming");
-    btnSend.title = "Stop Generating";
-  } else {
-    btnSend.innerHTML = "↑";
-    btnSend.classList.remove("streaming");
-    btnSend.title = "Send Message";
+  if (btnSend) {
+    if (isStreaming) {
+      btnSend.innerHTML = "■";
+      btnSend.classList.add("streaming");
+      btnSend.title = "Stop Generating";
+    } else {
+      btnSend.innerHTML = "↑";
+      btnSend.classList.remove("streaming");
+      btnSend.title = "Send Message";
+    }
+  }
+  if (btnMic) {
+    btnMic.disabled = Boolean(isStreaming);
+    if (isStreaming) {
+      setVoiceStatus(VOICE_STATUS.PROCESSING);
+    } else if (!isListening) {
+      setVoiceStatus(VOICE_STATUS.IDLE);
+      btnMic.title = "Voice input";
+    }
   }
 }
 
 /** Auto-resize textarea to fit typed content. */
 function autoResizeInput() {
+  if (!chatInput) return;
   chatInput.style.height = "auto";
   chatInput.style.height = Math.min(chatInput.scrollHeight, MAX_TEXTAREA_HEIGHT_PX) + "px";
 }
 
-/** Clear attached file. */
+/** Clear attached file and reset the file-chip UI. */
 function clearAttachedFile() {
   attachedFile = null;
-  fileInput.value = "";
-  fileTray.classList.remove("visible");
-  btnAttach.classList.remove("has-attachment");
+  if (fileInput) fileInput.value = "";
+  if (fileTray) fileTray.classList.remove("visible");
+  if (btnAttach) btnAttach.classList.remove("has-attachment");
+}
+
+/**
+ * Update the status label under the mic.
+ * @param {string} text
+ */
+function setVoiceStatus(text) {
+  assert: typeof text === "string";
+  if (!voiceStatusEl) return;
+  voiceStatusEl.textContent = text;
+}
+
+/**
+ * Show or clear the live interim user transcript above the mic.
+ * @param {string} text
+ */
+function setLiveTranscript(text) {
+  assert: typeof text === "string";
+  if (!liveTranscriptEl) return;
+  const trimmed = text.trim();
+  liveTranscriptEl.textContent = trimmed;
+  liveTranscriptEl.classList.toggle("visible", trimmed.length > 0);
+}
+
+/**
+ * Return the browser SpeechRecognition constructor, or null if unsupported.
+ * @returns {typeof SpeechRecognition | null}
+ */
+function getSpeechRecognitionCtor() {
+  return window.SpeechRecognition || window.webkitSpeechRecognition || null;
+}
+
+/**
+ * Start on-device SpeechRecognition in parallel with PCM streaming so we can
+ * display what the user said. Does not affect the audio sent to Paradigm.
+ */
+function startUserTranscriptCapture() {
+  const Ctor = getSpeechRecognitionCtor();
+  transcriptFinalParts = [];
+  transcriptInterim = "";
+  setLiveTranscript("");
+
+  if (!Ctor) {
+    setVoiceStatus(VOICE_STATUS.LISTENING);
+    return;
+  }
+
+  userSpeechRecognizer = new Ctor();
+  userSpeechRecognizer.continuous = true;
+  userSpeechRecognizer.interimResults = true;
+  userSpeechRecognizer.lang = USER_TRANSCRIPT_LANG;
+
+  userSpeechRecognizer.onresult = (event) => {
+    let interim = "";
+    for (let i = event.resultIndex; i < event.results.length; i++) {
+      const piece = event.results[i][0].transcript;
+      if (event.results[i].isFinal) {
+        const cleaned = piece.trim();
+        if (cleaned) transcriptFinalParts.push(cleaned);
+      } else {
+        interim += piece;
+      }
+    }
+    transcriptInterim = interim;
+    const display = [...transcriptFinalParts, transcriptInterim]
+      .filter((p) => typeof p === "string" && p.trim().length > 0)
+      .join(" ");
+    setLiveTranscript(display);
+  };
+
+  userSpeechRecognizer.onerror = (err) => {
+    // nonetwork / no-speech are common; keep PCM path alive and surface quietly.
+    console.warn("User transcript SpeechRecognition error:", err.error || err);
+  };
+
+  try {
+    userSpeechRecognizer.start();
+  } catch (err) {
+    console.error("Failed to start user transcript capture:", err);
+    userSpeechRecognizer = null;
+  }
+}
+
+/**
+ * Stop parallel SpeechRecognition and return the best available transcript.
+ * @returns {string} Finalized (+ trailing interim) transcript, may be empty
+ */
+function stopUserTranscriptCapture() {
+  const text = [...transcriptFinalParts, transcriptInterim]
+    .filter((p) => typeof p === "string" && p.trim().length > 0)
+    .join(" ")
+    .trim();
+
+  if (userSpeechRecognizer !== null) {
+    try { userSpeechRecognizer.onresult = null; } catch {}
+    try { userSpeechRecognizer.stop(); } catch {}
+    userSpeechRecognizer = null;
+  }
+  transcriptFinalParts = [];
+  transcriptInterim = "";
+  return text;
 }
 
 /** Reset entire chat conversation. */
@@ -568,24 +702,32 @@ function resetChat() {
   }
   isStreaming = false;
   abortController = null;
+  stopUserTranscriptCapture();
+  setLiveTranscript("");
   messagesList.innerHTML = "";
   messagesList.style.display = "none";
   welcomeHero.style.display = "flex";
   clearAttachedFile();
-  chatInput.value = "";
-  autoResizeInput();
-  chatInput.focus();
+  if (chatInput) {
+    chatInput.value = "";
+    autoResizeInput();
+    chatInput.focus();
+  }
   updateSendControls();
 }
 
-/** Stop and clean up an active audio capture and playback session. */
+/** Stop and clean up an active live mic capture + WebSocket session. */
 function stopAudioStream() {
   isListening = false;
-  btnMic.classList.remove("listening");
-  btnMic.classList.remove("speaking");
-  btnMic.title = "Voice Input";
+  if (btnMic) {
+    btnMic.classList.remove("listening");
+    btnMic.classList.remove("speaking");
+    btnMic.title = "Voice input";
+  }
+  if (!isStreaming) {
+    setVoiceStatus(VOICE_STATUS.IDLE);
+  }
 
-  // Stop ScriptProcessorNode and AudioContext for mic
   if (micProcessorNode) {
     try { micProcessorNode.disconnect(); } catch {}
     micProcessorNode = null;
@@ -598,14 +740,10 @@ function stopAudioStream() {
     try { micAudioContext.close(); } catch {}
     micAudioContext = null;
   }
-
-  // Stop raw microphone tracks
   if (audioStream) {
-    audioStream.getTracks().forEach(t => t.stop());
+    audioStream.getTracks().forEach((t) => t.stop());
     audioStream = null;
   }
-
-  // Send end sentinel and close upstream WebSocket
   if (audioWs && audioWs.readyState === WebSocket.OPEN) {
     try { audioWs.send("__end__"); } catch {}
     try { audioWs.close(); } catch {}
@@ -620,7 +758,10 @@ function stopPlayback() {
     playbackAudioContext = null;
   }
   playbackScheduleTime = 0;
-  btnMic.classList.remove("speaking");
+  if (btnMic) btnMic.classList.remove("speaking");
+  if (!isListening && !isStreaming) {
+    setVoiceStatus(VOICE_STATUS.IDLE);
+  }
 }
 
 /** Stop any active replay (PCM AudioContext or file HTMLAudioElement). */
@@ -696,19 +837,22 @@ function playAudioFileUrl(objectUrl, replayBar, durLabel = "…") {
 
   audio.onended = () => {
     fileReplayAudio = null;
-    btnMic.classList.remove("speaking");
+    if (btnMic) btnMic.classList.remove("speaking");
+    if (!isListening && !isStreaming) setVoiceStatus(VOICE_STATUS.IDLE);
     _setFileReplayBarState(replayBar, "idle", objectUrl, durLabel);
   };
   audio.onerror = () => {
     fileReplayAudio = null;
-    btnMic.classList.remove("speaking");
+    if (btnMic) btnMic.classList.remove("speaking");
+    if (!isListening && !isStreaming) setVoiceStatus(VOICE_STATUS.IDLE);
     _setFileReplayBarState(replayBar, "idle", objectUrl, durLabel);
     console.error("Browser failed to decode or play the audio file response.");
   };
 
   audio.play().catch((err) => {
     fileReplayAudio = null;
-    btnMic.classList.remove("speaking");
+    if (btnMic) btnMic.classList.remove("speaking");
+    if (!isListening && !isStreaming) setVoiceStatus(VOICE_STATUS.IDLE);
     _setFileReplayBarState(replayBar, "idle", objectUrl, durLabel);
     console.error(`Audio autoplay blocked or failed: ${err.message}`);
   });
@@ -757,48 +901,99 @@ function _setFileReplayBarState(replayBar, state, objectUrl, durLabel = "…") {
 }
 
 /**
- * Decode final_output.audio_file_output_b64, show the replay bar, and auto-play.
+ * True when final_output includes a playable file-audio payload (b64 and/or URL).
+ *
+ * @param {Record<string, unknown>} finalOutput
+ * @returns {boolean}
+ */
+function hasAudioFileResponse(finalOutput) {
+  assert: typeof finalOutput === "object" && finalOutput !== null;
+  const b64 = finalOutput.audio_file_output_b64;
+  const publicUrl = finalOutput.audio_file_output_public_url;
+  const hasB64 = typeof b64 === "string" && b64.length > 0;
+  const hasUrl = typeof publicUrl === "string" && publicUrl.length > 0;
+  return hasB64 || hasUrl;
+}
+
+/**
+ * Resolve MIME type from Paradigm field names (new or legacy).
+ *
+ * @param {Record<string, unknown>} finalOutput
+ * @returns {string}
+ */
+function resolveAudioFileMime(finalOutput) {
+  assert: typeof finalOutput === "object" && finalOutput !== null;
+  if (
+    typeof finalOutput.audio_file_output_mimetype === "string" &&
+    finalOutput.audio_file_output_mimetype.length > 0
+  ) {
+    return finalOutput.audio_file_output_mimetype;
+  }
+  if (typeof finalOutput.mimetype === "string" && finalOutput.mimetype.length > 0) {
+    return finalOutput.mimetype;
+  }
+  return DEFAULT_AUDIO_FILE_MIMETYPE;
+}
+
+/**
+ * Build a browser-playable URL from final_output file-audio fields.
+ * Prefers base64 (Blob URL); otherwise uses audio_file_output_public_url.
+ *
+ * @param {Record<string, unknown>} finalOutput
+ * @returns {string}
+ * @throws {Error} if neither b64 nor public URL is present/valid
+ */
+function resolvePlayableAudioUrl(finalOutput) {
+  assert: typeof finalOutput === "object" && finalOutput !== null;
+
+  const b64 = finalOutput.audio_file_output_b64;
+  if (typeof b64 === "string" && b64.length > 0) {
+    const mime = resolveAudioFileMime(finalOutput);
+    const bytes = base64ToUint8Array(b64);
+    return URL.createObjectURL(new Blob([bytes], { type: mime }));
+  }
+
+  const publicUrl = finalOutput.audio_file_output_public_url;
+  if (typeof publicUrl === "string" && publicUrl.length > 0) {
+    return publicUrl;
+  }
+
+  throw new Error(
+    "final_output has neither audio_file_output_b64 nor audio_file_output_public_url."
+  );
+}
+
+/**
+ * Play file-audio from final_output (base64 Blob and/or public URL), show replay bar.
  * Used when the workflow returns a full audio file instead of streaming PCM chunks.
  *
- * @param {{ audio_file_output_b64: string, mimetype?: string }} finalOutput
+ * @param {Record<string, unknown>} finalOutput
  * @param {HTMLElement} replayBar
- * @throws {Error} if base64 is missing/invalid
+ * @throws {Error} if no playable audio fields are present
  */
 function handleAudioFileOutput(finalOutput, replayBar) {
   assert: typeof finalOutput === "object" && finalOutput !== null;
   assert: typeof replayBar === "object" && replayBar !== null;
 
-  const b64 = finalOutput.audio_file_output_b64;
-  if (typeof b64 !== "string" || b64.length === 0) {
-    throw new Error("final_output.audio_file_output_b64 is missing or empty.");
-  }
+  const playableUrl = resolvePlayableAudioUrl(finalOutput);
+  assert: typeof playableUrl === "string" && playableUrl.length > 0;
 
-  const mime =
-    typeof finalOutput.mimetype === "string" && finalOutput.mimetype.length > 0
-      ? finalOutput.mimetype
-      : DEFAULT_AUDIO_FILE_MIMETYPE;
-
-  const bytes = base64ToUint8Array(b64);
-  const blob = new Blob([bytes], { type: mime });
-  const objectUrl = URL.createObjectURL(blob);
-
-  // Probe duration for the label, then show the bar and auto-play.
-  const probe = new Audio(objectUrl);
+  const probe = new Audio(playableUrl);
   let revealed = false;
   const reveal = (durLabel) => {
     if (revealed) return;
     revealed = true;
-    _setFileReplayBarState(replayBar, "idle", objectUrl, durLabel);
+    _setFileReplayBarState(replayBar, "idle", playableUrl, durLabel);
     replayBar.style.display = "flex";
     scrollToBottom();
-    playAudioFileUrl(objectUrl, replayBar, durLabel);
+    playAudioFileUrl(playableUrl, replayBar, durLabel);
   };
 
   probe.addEventListener("loadedmetadata", () => {
     reveal(formatAudioDurationLabel(probe.duration));
   });
   probe.addEventListener("error", () => {
-    // Still offer replay; user gesture may succeed even if probe failed.
+    // Public URLs can fail CORS/metadata probe; still expose Play for a user gesture.
     reveal("?");
   });
 }
@@ -962,8 +1157,7 @@ function _setReplayBarState(replayBar, state, chunkStore) {
 
 /**
  * Set up mic capability detection on page load.
- * Configures SpeechRecognition fallback on plain HTTP, or enables full
- * PCM16 streaming on HTTPS/localhost.
+ * Live mic needs getUserMedia + WebSocket to /odisha/api/audio/stream/{id}.
  */
 function setupAudioStreaming() {
   if (!btnMic) return;
@@ -971,77 +1165,24 @@ function setupAudioStreaming() {
     navigator.mediaDevices && navigator.mediaDevices.getUserMedia;
 
   if (hasGetUserMedia) {
-    btnMic.title = "Voice Input (Live Audio Stream)";
+    btnMic.title = "Tap to speak";
+    setVoiceStatus(VOICE_STATUS.IDLE);
     return;
   }
 
-  const SpeechRecognition =
-    window.SpeechRecognition || window.webkitSpeechRecognition;
-
-  if (!SpeechRecognition) {
-    btnMic.title = "Voice input unavailable (need HTTPS or Chrome/Edge).";
-    btnMic.disabled = true;
-    return;
-  }
-
-  speechRecognizer = new SpeechRecognition();
-  speechRecognizer.continuous = false;
-  speechRecognizer.interimResults = true;
-  speechRecognizer.lang = "en-US";
-
-  speechRecognizer.onstart = () => {
-    isListening = true;
-    btnMic.classList.add("listening");
-    btnMic.title = "Listening… Click to stop";
-  };
-
-  speechRecognizer.onresult = (event) => {
-    let transcript = "";
-    for (let i = event.resultIndex; i < event.results.length; i++) {
-      transcript += event.results[i][0].transcript;
-    }
-    chatInput.value = transcript;
-    autoResizeInput();
-  };
-
-  speechRecognizer.onerror = (err) => {
-    console.warn("SpeechRecognition error:", err);
-    isListening = false;
-    btnMic.classList.remove("listening");
-    btnMic.title = "Voice Input";
-  };
-
-  speechRecognizer.onend = () => {
-    isListening = false;
-    btnMic.classList.remove("listening");
-    btnMic.title = "Voice Input";
-  };
+  btnMic.title = VOICE_STATUS.UNAVAILABLE;
+  btnMic.disabled = true;
+  setVoiceStatus(VOICE_STATUS.UNAVAILABLE);
 }
 
 /**
  * Toggle live audio streaming mic on/off.
- * On start: get mic → open WS → start ScriptProcessorNode → fire /odisha/api/audio/execute.
- * On stop: send "__end__" → close WS → stream response into chat like text.
+ * On start: get mic → open WS → stream PCM16 + transcript capture.
+ * On stop: end sentinel → POST /audio/execute with stream_id (stream_refs).
  */
 async function toggleAudioStream() {
-  if (isStreaming) return; // don't allow mic while text stream in progress
+  if (isStreaming) return;
 
-  // ── HTTP / no-getUserMedia fallback: use browser SpeechRecognition ──────
-  if (speechRecognizer) {
-    if (isListening) {
-      isListening = false;
-      btnMic.classList.remove("listening");
-      btnMic.title = "Voice Input (Dictation mode — serve over HTTPS for live audio)";
-      try { speechRecognizer.stop(); } catch {}
-    } else {
-      try { speechRecognizer.start(); } catch (e) {
-        console.error("SpeechRecognition start error:", e);
-      }
-    }
-    return;
-  }
-
-  // ── HTTPS / localhost path: full PCM16 binary streaming ─────────────
   if (isListening) {
     stopAudioStream();
     return;
@@ -1050,58 +1191,56 @@ async function toggleAudioStream() {
   try {
     audioStream = await navigator.mediaDevices.getUserMedia({ audio: true });
   } catch (err) {
-    alert(`Microphone access denied: ${err.message}`);
+    appendErrorCard(`Microphone access denied: ${err.message}`, "");
     return;
   }
 
   isListening = true;
   btnMic.classList.add("listening");
-  btnMic.title = "Recording… Click to stop and send";
+  btnMic.title = "Listening… tap mic or Send to submit";
+  if (btnSend) btnSend.title = "Send voice message";
+  setVoiceStatus(VOICE_STATUS.LISTENING);
+  startUserTranscriptCapture();
 
   const streamId = crypto.randomUUID
     ? crypto.randomUUID()
     : `${Date.now()}-${Math.random().toString(36).slice(2)}`;
 
-  // Build the AudioContext at the browser's native sample rate first, then
-  // let the ScriptProcessorNode downsample to MIC_TARGET_SAMPLE_RATE.
   micAudioContext = new (window.AudioContext || window.webkitAudioContext)();
-  micSourceNode   = micAudioContext.createMediaStreamSource(audioStream);
+  micSourceNode = micAudioContext.createMediaStreamSource(audioStream);
+  micProcessorNode = micAudioContext.createScriptProcessor(MIC_BUFFER_SIZE, 1, 1);
 
-  // ScriptProcessorNode gives us raw Float32 PCM from the mic
-  micProcessorNode = micAudioContext.createScriptProcessor(
-    MIC_BUFFER_SIZE, 1, 1
-  );
-
-  // Open WebSocket to backend proxy FIRST, before starting the processor
   audioWs = new WebSocket(ENDPOINTS.AUDIO_WS(streamId));
   audioWs.binaryType = "arraybuffer";
 
   audioWs.onerror = () => {
+    stopUserTranscriptCapture();
+    setLiveTranscript("");
     stopAudioStream();
     appendErrorCard("Audio WebSocket connection failed. Is the server running?", "");
   };
 
-  // Wait for WS to open
   await new Promise((resolve, reject) => {
-    audioWs.onopen  = resolve;
+    audioWs.onopen = resolve;
     audioWs.onerror = reject;
-  }).catch(() => { stopAudioStream(); return; });
+  }).catch(() => {
+    stopUserTranscriptCapture();
+    setLiveTranscript("");
+    stopAudioStream();
+  });
 
   if (!audioWs || audioWs.readyState !== WebSocket.OPEN) return;
 
-  // Compute the integer downsampling ratio (browser rate ÷ target rate)
-  const nativeRate   = micAudioContext.sampleRate;  // e.g. 48000
-  const downsampleRatio = Math.round(nativeRate / MIC_TARGET_SAMPLE_RATE); // e.g. 3
+  const nativeRate = micAudioContext.sampleRate;
+  const downsampleRatio = Math.max(1, Math.round(nativeRate / MIC_TARGET_SAMPLE_RATE));
 
   micProcessorNode.onaudioprocess = (e) => {
     if (!audioWs || audioWs.readyState !== WebSocket.OPEN) return;
-
     const inputFloat32 = e.inputBuffer.getChannelData(0);
-    // Downsample by picking every downsampleRatio-th sample
-    const outLen  = Math.floor(inputFloat32.length / downsampleRatio);
-    const int16   = new Int16Array(outLen);
+    const outLen = Math.floor(inputFloat32.length / downsampleRatio);
+    if (outLen <= 0) return;
+    const int16 = new Int16Array(outLen);
     for (let i = 0; i < outLen; i++) {
-      // Clamp to [-1, 1] before converting to Int16
       const sample = Math.max(-1.0, Math.min(1.0, inputFloat32[i * downsampleRatio]));
       int16[i] = sample < 0 ? sample * 0x8000 : sample * 0x7FFF;
     }
@@ -1109,32 +1248,39 @@ async function toggleAudioStream() {
   };
 
   micSourceNode.connect(micProcessorNode);
-  // Connect to destination with zero gain so we don't hear our own mic
   micProcessorNode.connect(micAudioContext.destination);
 
-  // Define the completion handler to be executed by the button toggle logic
-  const onStopRecording = async () => {
-    // Disconnect processor and stop mic
-    try { micProcessorNode.disconnect(); } catch {}
-    try { micSourceNode.disconnect(); } catch {}
+  /**
+   * @param {string} userTranscript
+   */
+  const onStopRecording = async (userTranscript) => {
+    assert: typeof userTranscript === "string";
 
-    // Send end sentinel and close WS
+    try { micProcessorNode && micProcessorNode.disconnect(); } catch {}
+    try { micSourceNode && micSourceNode.disconnect(); } catch {}
+
     if (audioWs && audioWs.readyState === WebSocket.OPEN) {
       try { audioWs.send("__end__"); } catch {}
-      await new Promise(r => setTimeout(r, 200));
+      await new Promise((r) => setTimeout(r, 200));
       try { audioWs.close(); } catch {}
     }
+    audioWs = null;
 
     isStreaming = true;
     updateSendControls();
+    setLiveTranscript("");
 
-    // Show a placeholder message that voice was sent
-    appendUserMessage("🎤 (Voice message sent)", null);
+    const displayText =
+      userTranscript.trim().length > 0
+        ? userTranscript.trim()
+        : "Voice message (transcript unavailable)";
+    appendUserMessage(displayText, null);
+
     const { textContainer, citationSection, audioReplayContainer } = createAssistantCard();
     let tokenBuffer = "";
     let hasReceivedToken = false;
     let hasAudioOutput = false;
-    const chunkStore = [];  // Accumulates PCM16 chunks for replay
+    const chunkStore = [];
 
     try {
       const form = new FormData();
@@ -1173,12 +1319,12 @@ async function toggleAudioStream() {
             textContainer.innerHTML = renderMarkdown(tokenBuffer) + '<span class="streaming-cursor"></span>';
             scrollToBottom();
           } else if (evType === "audio_chunk") {
-            // Voice model response — play audio in browser
             if (!hasReceivedToken && !hasAudioOutput) {
               hasReceivedToken = true;
               hasAudioOutput = true;
               textContainer.innerHTML = '<p><em>&#127908; Speaking…</em></p>';
-              btnMic.classList.add("speaking");
+              if (btnMic) btnMic.classList.add("speaking");
+              setVoiceStatus(VOICE_STATUS.SPEAKING);
             }
             handleAudioChunk(payload, chunkStore);
           } else if (evType === "complete") {
@@ -1192,10 +1338,7 @@ async function toggleAudioStream() {
             if (hasAudioOutput && chunkStore.length > 0) {
               textContainer.innerHTML = "";
               showAudioReplayButton(audioReplayContainer, chunkStore);
-            } else if (
-              typeof fo.audio_file_output_b64 === "string" &&
-              fo.audio_file_output_b64.length > 0
-            ) {
+            } else if (hasAudioFileResponse(fo)) {
               if (final) {
                 textContainer.innerHTML = renderMarkdown(final);
                 updateCitations(citationSection, final, null);
@@ -1204,6 +1347,7 @@ async function toggleAudioStream() {
               }
               try {
                 handleAudioFileOutput(fo, audioReplayContainer);
+                setVoiceStatus(VOICE_STATUS.SPEAKING);
               } catch (audioErr) {
                 textContainer.innerHTML =
                   `<p class="error-inline">Could not play audio response: ${audioErr.message}</p>`;
@@ -1239,6 +1383,24 @@ async function toggleAudioStream() {
   btnMic._onStopRecording = onStopRecording;
 }
 
+/**
+ * Finalize an active live-mic session and run ``/audio/execute``.
+ * Shared by a second mic tap and the Send button / Enter key.
+ *
+ * @returns {Promise<boolean>} ``true`` when a recording was submitted.
+ */
+async function submitLiveMicRecording() {
+  if (!isListening) return false;
+  if (!btnMic || typeof btnMic._onStopRecording !== "function") return false;
+
+  const onStop = btnMic._onStopRecording;
+  btnMic._onStopRecording = null;
+  const userTranscript = stopUserTranscriptCapture();
+  stopAudioStream();
+  await onStop(userTranscript);
+  return true;
+}
+
 /** Export conversation history to a markdown file. */
 function exportConversation() {
   const userMessages = document.querySelectorAll(".msg-row");
@@ -1269,64 +1431,66 @@ function exportConversation() {
 
 /* ── Event Listeners ──────────────────────────────────────────────────── */
 
-// Send button
-btnSend.addEventListener("click", () => {
-  if (isStreaming) {
-    if (abortController) abortController.abort();
-    return;
-  }
-  const query = chatInput.value.trim();
-  if (!query) return;
-  chatInput.value = "";
-  autoResizeInput();
-  sendMessage(query);
-});
-
-// Keyboard: Enter sends, Shift+Enter inserts newline
-chatInput.addEventListener("keydown", (e) => {
-  if (e.key === "Enter" && !e.shiftKey) {
-    e.preventDefault();
+if (btnSend) {
+  btnSend.addEventListener("click", async () => {
     if (isStreaming) {
       if (abortController) abortController.abort();
-    } else {
+      return;
+    }
+    // Mic is live: Send finalizes the recording (same as tapping mic again).
+    if (isListening) {
+      await submitLiveMicRecording();
+      return;
+    }
+    if (!chatInput) return;
+    const query = chatInput.value.trim();
+    if (!query) return;
+    chatInput.value = "";
+    autoResizeInput();
+    sendMessage(query);
+  });
+}
+
+if (chatInput) {
+  chatInput.addEventListener("keydown", async (e) => {
+    if (e.key === "Enter" && !e.shiftKey) {
+      e.preventDefault();
+      if (isStreaming) return;
+      if (isListening) {
+        await submitLiveMicRecording();
+        return;
+      }
       const query = chatInput.value.trim();
       if (!query) return;
       chatInput.value = "";
       autoResizeInput();
       sendMessage(query);
     }
-  }
-});
-
-if (chatInput) {
+  });
   chatInput.addEventListener("input", autoResizeInput);
 }
 
-// New Chat button
 if (btnNewChat) {
   btnNewChat.addEventListener("click", resetChat);
 }
 
-// Export Chat button
 if (btnExportChat) {
   btnExportChat.addEventListener("click", exportConversation);
 }
 
-// File Attachment handling
 if (btnAttach && fileInput) {
   btnAttach.addEventListener("click", () => fileInput.click());
 }
 
 if (fileInput) {
   fileInput.addEventListener("change", () => {
-    const file = fileInput.files[0];
-    if (file) {
-      attachedFile = file;
-      if (chipFileName) chipFileName.textContent = file.name;
-      if (chipFileSize) chipFileSize.textContent = `(${formatFileSize(file.size)})`;
-      if (fileTray) fileTray.classList.add("visible");
-      if (btnAttach) btnAttach.classList.add("has-attachment");
-    }
+    const file = fileInput.files && fileInput.files[0];
+    if (!file) return;
+    attachedFile = file;
+    if (chipFileName) chipFileName.textContent = file.name;
+    if (chipFileSize) chipFileSize.textContent = `(${formatFileSize(file.size)})`;
+    if (fileTray) fileTray.classList.add("visible");
+    if (btnAttach) btnAttach.classList.add("has-attachment");
   });
 }
 
@@ -1334,44 +1498,23 @@ if (btnRemoveChip) {
   btnRemoveChip.addEventListener("click", clearAttachedFile);
 }
 
-// Voice Mic Button — toggles live PCM16 audio streaming or speech dictation
+// Mic — start/stop live PCM16 streaming; capture transcript before tear-down
 if (btnMic) {
   btnMic.addEventListener("click", async () => {
-    // If there's a pending stop-and-execute callback, trigger it
-    if (isListening && btnMic._onStopRecording) {
-      const cb = btnMic._onStopRecording;
-      btnMic._onStopRecording = null;
-      stopAudioStream();
-      await cb();
-    } else {
-      await toggleAudioStream();
+    if (isStreaming) return;
+
+    if (isListening) {
+      await submitLiveMicRecording();
+      return;
     }
+
+    await toggleAudioStream();
   });
 }
-
-// Web Search Toggle Pill
-if (btnWebSearch) {
-  btnWebSearch.addEventListener("click", () => {
-    isWebSearchOn = !isWebSearchOn;
-    btnWebSearch.classList.toggle("active", isWebSearchOn);
-    btnWebSearch.title = isWebSearchOn ? "Web Search: ON" : "Web Search: OFF";
-  });
-}
-
-// Prompt Chips Click
-document.querySelectorAll(".prompt-chip").forEach(chip => {
-  chip.addEventListener("click", () => {
-    const prompt = chip.getAttribute("data-prompt");
-    if (prompt && chatInput) {
-      chatInput.value = prompt;
-      autoResizeInput();
-      if (btnSend) btnSend.click();
-    }
-  });
-});
 
 /* ── Initialization ───────────────────────────────────────────────────── */
 setupAudioStreaming();
+updateSendControls();
 if (chatInput) {
   chatInput.focus();
 }
