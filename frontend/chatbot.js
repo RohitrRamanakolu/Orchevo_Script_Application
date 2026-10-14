@@ -6,25 +6,31 @@
  * Audio Architecture:
  * - INPUT:  Web Audio API ScriptProcessorNode downsamples microphone to 16 kHz
  *           mono Int16 PCM and streams binary chunks over WebSocket.
- * - OUTPUT: Incoming SSE audio_chunk events (base64 PCM16 @ sample_rate) are
+ * - OUTPUT (streamed): SSE audio_chunk events (base64 PCM16 @ sample_rate) are
  *           decoded and played seamlessly via a scheduled Web Audio API buffer
  *           queue at the chunk's native sample rate (usually 24 kHz).
+ * - OUTPUT (file):    SSE complete.final_output.audio_file_output_b64 (WAV/MP3
+ *           base64) is decoded to a Blob, auto-played, and offered for replay.
  */
 
 /* ── Constants ────────────────────────────────────────────────────────── */
 const API_BASE = window.location.origin;
 const WS_BASE = API_BASE.replace(/^https/, "wss").replace(/^http/, "ws");
+/** Must match backend ``_API_PREFIX`` in main.py. */
+const API_PREFIX = "/odisha";
 const ENDPOINTS = Object.freeze({
-  CHAT_STREAM:    `${API_BASE}/api/chat/stream`,
-  AUDIO_EXECUTE:  `${API_BASE}/api/audio/execute`,
-  AUDIO_WS:       (streamId) => `${WS_BASE}/api/audio/stream/${streamId}`,
-  HEALTH:         `${API_BASE}/api/health-check`,
+  CHAT_STREAM:    `${API_BASE}${API_PREFIX}/api/chat/stream`,
+  AUDIO_EXECUTE:  `${API_BASE}${API_PREFIX}/api/audio/execute`,
+  AUDIO_WS:       (streamId) => `${WS_BASE}${API_PREFIX}/api/audio/stream/${streamId}`,
+  HEALTH:         `${API_BASE}${API_PREFIX}/api/health-check`,
 });
 
 /** Target input sample rate required by Paradigm Platform voice/gemini-live nodes. */
 const MIC_TARGET_SAMPLE_RATE = 16000;
 /** ScriptProcessorNode buffer size — must be a power of two; 4096 ≈ 256 ms at 16 kHz. */
 const MIC_BUFFER_SIZE = 4096;
+/** Fallback MIME when complete.final_output.mimetype is absent (Paradigm WAV files). */
+const DEFAULT_AUDIO_FILE_MIMETYPE = "audio/wav";
 
 const AUTO_SCROLL_THRESHOLD_PX = 140;
 const MAX_TEXTAREA_HEIGHT_PX   = 160;
@@ -46,6 +52,7 @@ let audioStream          = null;   // getUserMedia stream handle (raw tracks)
 let playbackAudioContext = null;   // AudioContext for live streaming PCM16 playback
 let playbackScheduleTime = 0;      // Seconds on the playback clock scheduled so far
 let replayAudioContext   = null;   // AudioContext for replay (kept separate from live stream)
+let fileReplayAudio      = null;   // HTMLAudioElement for audio_file_output_b64 replay
 
 /* ── DOM Elements ─────────────────────────────────────────────────────── */
 const chatViewport     = document.getElementById("chat-viewport");
@@ -449,16 +456,38 @@ async function sendMessage(query) {
           }
           handleAudioChunk(eventPayload, chunkStore);
         } else if (evType === "complete") {
-          const finalResult = eventPayload.final_output?.output || tokenBuffer;
-          if (!hasAudioOutput) {
+          const fo = eventPayload.final_output || {};
+          const finalResult =
+            typeof fo.output === "string" && fo.output.length > 0
+              ? fo.output
+              : tokenBuffer;
+          stopPlayback();
+
+          if (hasAudioOutput && chunkStore.length > 0) {
+            textContainer.innerHTML = "";
+            showAudioReplayButton(audioReplayContainer, chunkStore);
+          } else if (
+            typeof fo.audio_file_output_b64 === "string" &&
+            fo.audio_file_output_b64.length > 0
+          ) {
+            if (finalResult) {
+              textContainer.innerHTML = renderMarkdown(finalResult);
+              updateCitations(citationSection, finalResult, fileToSend);
+            } else {
+              textContainer.innerHTML = "<p><em>&#127908; Audio response</em></p>";
+            }
+            try {
+              handleAudioFileOutput(fo, audioReplayContainer);
+            } catch (audioErr) {
+              textContainer.innerHTML =
+                `<p class="error-inline">Could not play audio response: ${audioErr.message}</p>`;
+            }
+          } else if (finalResult) {
             textContainer.innerHTML = renderMarkdown(finalResult);
             updateCitations(citationSection, finalResult, fileToSend);
           } else {
-            textContainer.innerHTML = "";
-          }
-          stopPlayback();
-          if (hasAudioOutput && chunkStore.length > 0) {
-            showAudioReplayButton(audioReplayContainer, chunkStore);
+            textContainer.innerHTML =
+              "<p class=\"error-inline\">Workflow completed with no text or audio output.</p>";
           }
           scrollToBottom();
         } else if (evType === "error") {
@@ -594,12 +623,184 @@ function stopPlayback() {
   btnMic.classList.remove("speaking");
 }
 
-/** Stop any active replay AudioContext. */
+/** Stop any active replay (PCM AudioContext or file HTMLAudioElement). */
 function stopReplay() {
   if (replayAudioContext && replayAudioContext.state !== "closed") {
     try { replayAudioContext.close(); } catch {}
     replayAudioContext = null;
   }
+  if (fileReplayAudio !== null) {
+    try {
+      fileReplayAudio.pause();
+      fileReplayAudio.currentTime = 0;
+    } catch {}
+    fileReplayAudio = null;
+  }
+}
+
+/**
+ * Decode a standard base64 string into a Uint8Array.
+ *
+ * @param {string} b64 - Non-empty base64 payload
+ * @returns {Uint8Array}
+ * @throws {Error} if b64 is empty or atob fails
+ */
+function base64ToUint8Array(b64) {
+  assert: typeof b64 === "string" && b64.length > 0;
+  let binaryStr;
+  try {
+    binaryStr = atob(b64);
+  } catch (err) {
+    throw new Error(`Invalid base64 audio payload: ${err.message}`);
+  }
+  assert: typeof binaryStr === "string" && binaryStr.length > 0;
+  const bytes = new Uint8Array(binaryStr.length);
+  for (let i = 0; i < binaryStr.length; i++) {
+    bytes[i] = binaryStr.charCodeAt(i);
+  }
+  return bytes;
+}
+
+/**
+ * Format a duration in seconds for the replay bar label.
+ * @param {number} totalSec
+ * @returns {string}
+ */
+function formatAudioDurationLabel(totalSec) {
+  if (typeof totalSec !== "number" || !Number.isFinite(totalSec) || totalSec < 0) {
+    return "?";
+  }
+  if (totalSec >= 60) {
+    return `${Math.floor(totalSec / 60)}m ${Math.round(totalSec % 60)}s`;
+  }
+  return `${totalSec.toFixed(1)}s`;
+}
+
+/**
+ * Play (or replay) a Blob object-URL via HTMLAudioElement and sync the replay bar.
+ *
+ * @param {string} objectUrl - createObjectURL result for the audio Blob
+ * @param {HTMLElement} replayBar
+ * @param {string} [durLabel]
+ */
+function playAudioFileUrl(objectUrl, replayBar, durLabel = "…") {
+  assert: typeof objectUrl === "string" && objectUrl.length > 0;
+  assert: typeof replayBar === "object" && replayBar !== null;
+
+  stopReplay();
+
+  const audio = new Audio(objectUrl);
+  fileReplayAudio = audio;
+  btnMic.classList.add("speaking");
+  _setFileReplayBarState(replayBar, "playing", objectUrl, durLabel);
+
+  audio.onended = () => {
+    fileReplayAudio = null;
+    btnMic.classList.remove("speaking");
+    _setFileReplayBarState(replayBar, "idle", objectUrl, durLabel);
+  };
+  audio.onerror = () => {
+    fileReplayAudio = null;
+    btnMic.classList.remove("speaking");
+    _setFileReplayBarState(replayBar, "idle", objectUrl, durLabel);
+    console.error("Browser failed to decode or play the audio file response.");
+  };
+
+  audio.play().catch((err) => {
+    fileReplayAudio = null;
+    btnMic.classList.remove("speaking");
+    _setFileReplayBarState(replayBar, "idle", objectUrl, durLabel);
+    console.error(`Audio autoplay blocked or failed: ${err.message}`);
+  });
+}
+
+/**
+ * Update the file-audio replay bar between idle (Play) and playing (Stop).
+ *
+ * @param {HTMLElement} replayBar
+ * @param {"idle" | "playing"} state
+ * @param {string} objectUrl
+ * @param {string} [durLabel] - Precomputed duration label for idle state
+ */
+function _setFileReplayBarState(replayBar, state, objectUrl, durLabel = "…") {
+  assert: typeof replayBar === "object" && replayBar !== null;
+  assert: state === "idle" || state === "playing";
+
+  if (state === "playing") {
+    replayBar.innerHTML = `
+      <button class="btn-audio-replay btn-audio-replay--playing" title="Stop replay">
+        <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24"
+             fill="currentColor" aria-hidden="true"><rect x="6" y="6" width="12" height="12" rx="2"/></svg>
+        Stop
+      </button>
+      <span class="audio-replay-label">Playing response audio…</span>
+    `;
+    replayBar.querySelector(".btn-audio-replay").addEventListener("click", () => {
+      stopReplay();
+      btnMic.classList.remove("speaking");
+      _setFileReplayBarState(replayBar, "idle", objectUrl, durLabel);
+    });
+    return;
+  }
+
+  replayBar.innerHTML = `
+    <button class="btn-audio-replay" title="Replay audio response">
+      <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24"
+           fill="currentColor" aria-hidden="true"><polygon points="5,3 19,12 5,21"/></svg>
+      Play Audio
+    </button>
+    <span class="audio-replay-label">Audio response &middot; ${durLabel}</span>
+  `;
+  replayBar.querySelector(".btn-audio-replay").addEventListener("click", () => {
+    playAudioFileUrl(objectUrl, replayBar, durLabel);
+  });
+}
+
+/**
+ * Decode final_output.audio_file_output_b64, show the replay bar, and auto-play.
+ * Used when the workflow returns a full audio file instead of streaming PCM chunks.
+ *
+ * @param {{ audio_file_output_b64: string, mimetype?: string }} finalOutput
+ * @param {HTMLElement} replayBar
+ * @throws {Error} if base64 is missing/invalid
+ */
+function handleAudioFileOutput(finalOutput, replayBar) {
+  assert: typeof finalOutput === "object" && finalOutput !== null;
+  assert: typeof replayBar === "object" && replayBar !== null;
+
+  const b64 = finalOutput.audio_file_output_b64;
+  if (typeof b64 !== "string" || b64.length === 0) {
+    throw new Error("final_output.audio_file_output_b64 is missing or empty.");
+  }
+
+  const mime =
+    typeof finalOutput.mimetype === "string" && finalOutput.mimetype.length > 0
+      ? finalOutput.mimetype
+      : DEFAULT_AUDIO_FILE_MIMETYPE;
+
+  const bytes = base64ToUint8Array(b64);
+  const blob = new Blob([bytes], { type: mime });
+  const objectUrl = URL.createObjectURL(blob);
+
+  // Probe duration for the label, then show the bar and auto-play.
+  const probe = new Audio(objectUrl);
+  let revealed = false;
+  const reveal = (durLabel) => {
+    if (revealed) return;
+    revealed = true;
+    _setFileReplayBarState(replayBar, "idle", objectUrl, durLabel);
+    replayBar.style.display = "flex";
+    scrollToBottom();
+    playAudioFileUrl(objectUrl, replayBar, durLabel);
+  };
+
+  probe.addEventListener("loadedmetadata", () => {
+    reveal(formatAudioDurationLabel(probe.duration));
+  });
+  probe.addEventListener("error", () => {
+    // Still offer replay; user gesture may succeed even if probe failed.
+    reveal("?");
+  });
 }
 
 /**
@@ -819,7 +1020,7 @@ function setupAudioStreaming() {
 
 /**
  * Toggle live audio streaming mic on/off.
- * On start: get mic → open WS → start ScriptProcessorNode → fire /api/audio/execute.
+ * On start: get mic → open WS → start ScriptProcessorNode → fire /odisha/api/audio/execute.
  * On stop: send "__end__" → close WS → stream response into chat like text.
  */
 async function toggleAudioStream() {
@@ -981,16 +1182,38 @@ async function toggleAudioStream() {
             }
             handleAudioChunk(payload, chunkStore);
           } else if (evType === "complete") {
-            const final = payload.final_output?.output || tokenBuffer;
-            if (!hasAudioOutput) {
+            const fo = payload.final_output || {};
+            const final =
+              typeof fo.output === "string" && fo.output.length > 0
+                ? fo.output
+                : tokenBuffer;
+            stopPlayback();
+
+            if (hasAudioOutput && chunkStore.length > 0) {
+              textContainer.innerHTML = "";
+              showAudioReplayButton(audioReplayContainer, chunkStore);
+            } else if (
+              typeof fo.audio_file_output_b64 === "string" &&
+              fo.audio_file_output_b64.length > 0
+            ) {
+              if (final) {
+                textContainer.innerHTML = renderMarkdown(final);
+                updateCitations(citationSection, final, null);
+              } else {
+                textContainer.innerHTML = "<p><em>&#127908; Audio response</em></p>";
+              }
+              try {
+                handleAudioFileOutput(fo, audioReplayContainer);
+              } catch (audioErr) {
+                textContainer.innerHTML =
+                  `<p class="error-inline">Could not play audio response: ${audioErr.message}</p>`;
+              }
+            } else if (final) {
               textContainer.innerHTML = renderMarkdown(final);
               updateCitations(citationSection, final, null);
             } else {
-              textContainer.innerHTML = "";
-            }
-            stopPlayback();
-            if (hasAudioOutput && chunkStore.length > 0) {
-              showAudioReplayButton(audioReplayContainer, chunkStore);
+              textContainer.innerHTML =
+                "<p class=\"error-inline\">Workflow completed with no text or audio output.</p>";
             }
             scrollToBottom();
           } else if (evType === "error") {

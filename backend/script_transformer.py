@@ -58,9 +58,11 @@ class ScriptMetadata:
         Ordered list of text input variable names in the ``inputs`` dict.
     file_var_names : list[str]
         Names of file-upload variables found in ``files={...}`` call arguments.
+        Paradigm publishes ``audio_stream`` Start variables as file uploads in
+        the downloadable snippet (e.g. ``files={"query": ...}``).
     audio_stream_var_name : str | None
         The key inside ``stream_refs`` that names the audio_stream Start variable,
-        or ``None`` if the script does not use live audio streaming.
+        or ``None`` when the script only declares the variable via ``files={...}``.
     has_audio_output : bool
         True when the script's SSE loop handles ``audio_chunk`` events.
     has_audio_file_output : bool
@@ -224,6 +226,56 @@ def inspect_script(script_source: str) -> ScriptMetadata:
         audio_stream_var_name=extractor.audio_stream_var_name,
         has_audio_output=extractor.has_audio_output,
         has_audio_file_output=extractor.has_audio_file_output,
+    )
+
+
+def resolve_audio_stream_var_name(meta: ScriptMetadata) -> str:
+    """Return the Start-variable name to use in ``stream_refs`` for live mic audio.
+
+    Paradigm Platform publish snippets treat ``audio_stream`` inputs as multipart
+    file uploads (``files={"query": ...}``) and do **not** emit a ``stream_refs``
+    dict. Live execution still requires ``stream_refs={var_name: stream_id}``
+    where ``var_name`` matches that Start variable.
+
+    Resolution order
+    ----------------
+    1. Explicit ``stream_refs`` key from the script (``meta.audio_stream_var_name``).
+    2. First multipart file variable from ``files={...}`` (``meta.file_var_names``).
+
+    Parameters
+    ----------
+    meta : ScriptMetadata
+        Metadata produced by ``inspect_script``.
+
+    Returns
+    -------
+    str
+        Non-empty Start variable name for ``stream_refs``.
+
+    Raises
+    ------
+    ValueError
+        If the script declares neither ``stream_refs`` nor a ``files={...}``
+        multipart variable — live mic cannot be mapped to a workflow input.
+    TypeError
+        If ``meta`` is not a ``ScriptMetadata`` instance.
+    """
+    assert isinstance(meta, ScriptMetadata), "meta must be a ScriptMetadata instance"
+
+    if meta.audio_stream_var_name:
+        name = meta.audio_stream_var_name.strip()
+        assert name, "audio_stream_var_name must be non-empty when set"
+        return name
+
+    if meta.file_var_names:
+        name = meta.file_var_names[0].strip()
+        assert name, "file_var_names[0] must be a non-empty string"
+        return name
+
+    raise ValueError(
+        "Cannot resolve live-audio stream_refs variable: script.py has neither "
+        "a stream_refs dict nor a files={...} multipart variable. Re-export a "
+        "workflow whose Start node declares an audio_stream (or audio_file) input."
     )
 
 

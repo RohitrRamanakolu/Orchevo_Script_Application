@@ -1,7 +1,7 @@
 import requests, json
 
-WORKFLOW_KEY = "Oo0T51TI8RLCTxPp7wPOGhD8wSwswPmE-Fd-PVR2qdo"
-WORKFLOW_ID  = "21b69fd2-b0bf-4ac8-8ac6-be47c14af0b9"
+WORKFLOW_KEY = "EllLSMeNIzI7iuJZuoFqXtK0jMoz6vT_fnOcl1Z7f4s"
+WORKFLOW_ID  = "fa925eb6-7a4e-4c0d-97b1-94f7370c69d8"
 BASE_URL     = "https://map-qa.paradigmit.ai/api/v1/agent-workflows"  # change if calling a different environment
 
 # ── Step 1: Create a session (once per conversation) ──────────────────────
@@ -15,38 +15,25 @@ session_resp = requests.post(
 session_resp.raise_for_status()
 session_id = session_resp.json()["session_id"]
 
-# ── Step 2: Execute ───────────────────────────────────────────────────────
-inputs = {"query": "<value>"}
-resp = requests.post(
-    f"{BASE_URL}/execute/stream",
-    data={
-        "inputs": json.dumps(inputs),
-        "workflow_id": WORKFLOW_ID,
-        "session_id": session_id,
-    },
-    headers={"X-Workflow-Key": WORKFLOW_KEY},
-    stream=True,
-)
-
-# Optional: attach a file for variable 'file'
-# with open("your_file.pdf", "rb") as file_f:
-#     resp = requests.post(
-#         f"{BASE_URL}/execute/stream",
-#         data={
-#             "inputs": json.dumps(inputs),
-#             "workflow_id": WORKFLOW_ID,
-#             "session_id": session_id,
-#         },
-#         files={"file": file_f},
-#         headers={"X-Workflow-Key": WORKFLOW_KEY},
-#         stream=True,
-#     )
+# ── Step 2: Execute with file ─────────────────────────────────────────────
+inputs = {}
+with open("your_file.wav", "rb") as query_f:
+    resp = requests.post(
+        f"{BASE_URL}/execute/stream",
+        data={
+            "inputs": json.dumps(inputs),
+            "workflow_id": WORKFLOW_ID,
+            "session_id": session_id,
+        },
+        files={"query": query_f},
+        headers={"X-Workflow-Key": WORKFLOW_KEY},
+        stream=True,
+    )
 resp.raise_for_status()
 
 # ── Step 3: Read the SSE stream ────────────────────────────────────────────
 # Events in order:
 #   session      — carries session_id + execution_id (always first)
-#   token        — one per generated token (streaming model nodes only)
 #   node_complete — after each node finishes: execution_ms, input, output,
 #                   token_usage, cost_usd, logs, status, error, session_id, execution_id
 #   complete     — final_output, node_traces, all_outputs, cost_usd, execution_path,
@@ -66,8 +53,6 @@ for raw_line in resp.iter_lines():
     ev = event.get("event")
     if ev == "session":
         execution_id = event.get("execution_id")
-    elif ev == "token":
-        print(event["token"], end="", flush=True)
     elif ev == "complete":
         result = event
     elif ev == "error":
@@ -80,10 +65,10 @@ if result is None:
 # ── Step 4: Read output ────────────────────────────────────────────────────
 # Output structure:
 # {
-#     "output": "...",
+#     "audio_file_output": "...",
 # }
 final_output = result["final_output"]
-output = final_output["output"]
+audio_file_output = final_output["audio_file_output"]
 
 # ── Optional: retrieve full session history ─────────────────────────────────
 # session_detail = requests.get(

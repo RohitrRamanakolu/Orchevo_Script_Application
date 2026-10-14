@@ -5,9 +5,11 @@
 
 /* ── Constants ────────────────────────────────────────────────────────── */
 const API_BASE = window.location.origin;
+/** Must match backend ``_API_PREFIX`` in main.py. */
+const API_PREFIX = "/odisha";
 const ENDPOINTS = Object.freeze({
-  CHAT_STREAM: `${API_BASE}/api/chat/stream`,
-  HEALTH:      `${API_BASE}/api/health-check`,
+  CHAT_STREAM: `${API_BASE}${API_PREFIX}/api/chat/stream`,
+  HEALTH:      `${API_BASE}${API_PREFIX}/api/health-check`,
 });
 
 const AUTO_SCROLL_THRESHOLD_PX = 120;

@@ -7,11 +7,11 @@ reconfigures the backend without a restart.
 
 Routes
 ------
-POST /api/chat/stream           — rewrite script.py, run as subprocess, stream SSE.
-POST /api/audio/execute         — fire execute/stream with stream_refs, relay SSE.
-WS   /api/audio/stream/{id}     — proxy mic audio to upstream audio-streams WS.
-GET  /api/health-check          — health probe.
-GET  /                          — serves chatbot.html.
+POST /odisha/api/chat/stream           — rewrite script.py, run as subprocess, stream SSE.
+POST /odisha/api/audio/execute         — fire execute/stream with stream_refs, relay SSE.
+WS   /odisha/api/audio/stream/{id}     — proxy mic audio to upstream audio-streams WS.
+GET  /odisha/api/health-check          — health probe.
+GET  /                                 — serves chatbot.html.
 """
 from __future__ import annotations
 
@@ -33,9 +33,17 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
-from script_transformer import inspect_script, rewrite_script, ScriptMetadata
+from script_transformer import (
+    inspect_script,
+    resolve_audio_stream_var_name,
+    rewrite_script,
+    ScriptMetadata,
+)
 
 app = FastAPI(title="Chat Workflow Backend", version="1.0.0")
+
+# Public path prefix for all HTTP/WS APIs (shared with the frontend ENDPOINTS).
+_API_PREFIX: str = "/odisha"
 
 # ── CORS ──────────────────────────────────────────────────────────────────
 app.add_middleware(
@@ -51,12 +59,12 @@ _SCRIPT_PATH: str = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sc
 # In-memory session store mapping frontend client IPs to platform session IDs
 _SESSIONS: dict[str, str] = {}
 
-# Fallback audio stream variable name — used when the script does not declare stream_refs
-_AUDIO_STREAM_VAR_FALLBACK: str = "audio_input"
-
 # Stdout marker emitted by script.py to carry the full final_output JSON payload
 # (including base64 audio data) back to the subprocess runner.
 _FINAL_OUTPUT_MARKER: str = "__FINAL_OUTPUT__:"
+
+# Max characters of an upstream error body to include in raised exceptions.
+_UPSTREAM_ERROR_BODY_LIMIT: int = 500
 
 
 def _get_script_metadata() -> ScriptMetadata:
@@ -84,7 +92,7 @@ def _get_script_metadata() -> ScriptMetadata:
 
 
 # ── Health ────────────────────────────────────────────────────────────────
-@app.get("/api/health-check")
+@app.get(f"{_API_PREFIX}/api/health-check")
 def health_check() -> dict[str, str]:
     """Return a simple health status.
 
@@ -112,6 +120,66 @@ def _build_sse_line(data: dict[str, Any]) -> str:
     """
     assert isinstance(data, dict), "SSE data must be a dict"
     return f"data: {json.dumps(data)}\n\n"
+
+
+def _raise_for_upstream_status(resp: requests.Response, context: str) -> None:
+    """Raise with status and response body when an upstream call fails.
+
+    Parameters
+    ----------
+    resp : requests.Response
+        Response from Paradigm ``/execute/stream`` (or similar).
+    context : str
+        Short label included in the error message (e.g. ``audio execute``).
+
+    Raises
+    ------
+    RuntimeError
+        When ``resp`` is not a successful HTTP response.
+    """
+    assert resp is not None, "upstream response must not be None"
+    assert isinstance(context, str) and context, "context must be a non-empty string"
+    if resp.ok:
+        return
+    body = (resp.text or "").strip()[:_UPSTREAM_ERROR_BODY_LIMIT]
+    detail = f" — {body}" if body else ""
+    raise RuntimeError(
+        f"Upstream {context} failed with HTTP {resp.status_code}{detail}"
+    )
+
+
+def _files_map_for_upload(meta: ScriptMetadata, uploaded_file_path: str) -> dict[str, str]:
+    """Build the ``files`` map for ``rewrite_script`` from script metadata.
+
+    Parameters
+    ----------
+    meta : ScriptMetadata
+        Introspected script metadata (must declare at least one file var).
+    uploaded_file_path : str
+        Absolute path to the temporary uploaded file on disk.
+
+    Returns
+    -------
+    dict[str, str]
+        Mapping ``{start_var_name: local_path}`` for AST rewriting.
+
+    Raises
+    ------
+    ValueError
+        If ``script.py`` declares no multipart file variables.
+    """
+    assert isinstance(meta, ScriptMetadata), "meta must be ScriptMetadata"
+    assert isinstance(uploaded_file_path, str) and uploaded_file_path, \
+        "uploaded_file_path must be a non-empty string"
+    assert os.path.isfile(uploaded_file_path), \
+        f"uploaded file does not exist: {uploaded_file_path}"
+
+    if not meta.file_var_names:
+        raise ValueError(
+            "An uploaded file was provided, but script.py declares no "
+            "files={...} multipart variables to bind it to."
+        )
+    return {meta.file_var_names[0]: uploaded_file_path}
 
 
 def _run_script_and_stream(query: str, client_id: str, uploaded_file_path: str | None = None):
@@ -144,15 +212,24 @@ def _run_script_and_stream(query: str, client_id: str, uploaded_file_path: str |
         with open(_SCRIPT_PATH, encoding="utf-8") as fh:
             source = fh.read()
 
+        meta = inspect_script(source)
+        if meta.file_var_names and not uploaded_file_path:
+            raise ValueError(
+                f"This workflow requires a file upload for variable(s) "
+                f"{meta.file_var_names}; attach a file before sending chat text."
+            )
+
         active_session_id = _SESSIONS.get(client_id)
-        files_map = {"file": uploaded_file_path} if uploaded_file_path else None
+        files_map: dict[str, str] | None = None
+        if uploaded_file_path:
+            files_map = _files_map_for_upload(meta, uploaded_file_path)
 
         # Rewrite the script with AST to inject inputs, files, and session
         modified_source = rewrite_script(
             script_source=source,
             query=query,
             session_id=active_session_id,
-            files=files_map
+            files=files_map,
         )
 
         # ── Write to a temp file next to script.py ────────────────────
@@ -253,13 +330,13 @@ def _run_script_and_stream(query: str, client_id: str, uploaded_file_path: str |
 
 
 # ── Audio WebSocket Proxy ────────────────────────────────────────────────
-@app.websocket("/api/audio/stream/{stream_id}")
+@app.websocket(f"{_API_PREFIX}/api/audio/stream/{{stream_id}}")
 async def audio_stream_proxy(websocket: WebSocket, stream_id: str) -> None:
     """Accept browser binary audio frames and relay them to the upstream
     audio-streams WebSocket endpoint in real time.
 
     The browser:
-      1. Opens this WS first (before calling /api/audio/execute).
+      1. Opens this WS first (before calling /odisha/api/audio/execute).
       2. Sends binary audio frames (e.g. Opus/WebM chunks from MediaRecorder).
       3. Sends text frame ``"__end__"`` or closes the socket when done.
 
@@ -351,11 +428,11 @@ async def audio_stream_proxy(websocket: WebSocket, stream_id: str) -> None:
             pass
 
 
-@app.post("/api/audio/execute")
+@app.post(f"{_API_PREFIX}/api/audio/execute")
 async def audio_execute(request: Request, stream_id: str = Form(...)) -> StreamingResponse:
     """Fire POST /execute/stream with stream_refs pointing at ``stream_id``.
 
-    Call this *after* opening the ``/api/audio/stream/{stream_id}`` WebSocket
+    Call this *after* opening the ``/odisha/api/audio/stream/{stream_id}`` WebSocket
     so the upstream workflow engine can consume the live audio queue.
 
     Parameters
@@ -417,9 +494,12 @@ def _run_audio_and_stream(stream_id: str, client_id: str):
             session_id = sess_resp.json()["session_id"]
             _SESSIONS[client_id] = session_id
 
-        # Step 3: Determine the audio stream variable name from the script.
-        # Falls back to the well-known default if the script has no stream_refs.
-        stream_var_name: str = meta.audio_stream_var_name or _AUDIO_STREAM_VAR_FALLBACK
+        # Step 3: Resolve stream_refs key from stream_refs or files={...} in script.py.
+        # Paradigm publish snippets expose audio_stream as files={"query": ...},
+        # not as a stream_refs literal — never invent a hardcoded var name.
+        stream_var_name: str = resolve_audio_stream_var_name(meta)
+        assert stream_var_name, "stream_var_name must be non-empty"
+        assert isinstance(stream_id, str) and stream_id, "stream_id must be non-empty"
 
         # Step 4: Fire execute/stream with stream_refs pointing at the live audio queue
         resp = requests.post(
@@ -434,7 +514,7 @@ def _run_audio_and_stream(stream_id: str, client_id: str):
             stream=True,
             timeout=120,
         )
-        resp.raise_for_status()
+        _raise_for_upstream_status(resp, "audio execute/stream")
 
         # Step 5: Relay SSE events from upstream to browser.
         # Handles both text (token) and audio (audio_chunk) output workflows.
@@ -487,7 +567,7 @@ def _run_audio_and_stream(stream_id: str, client_id: str):
 
 
 # ── Chat Streaming ────────────────────────────────────────────────────────
-@app.post("/api/chat/stream")
+@app.post(f"{_API_PREFIX}/api/chat/stream")
 async def chat_stream(
     request: Request,
     query: str = Form(...),
