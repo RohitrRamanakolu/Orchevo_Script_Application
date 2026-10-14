@@ -7,11 +7,16 @@ reconfigures the backend without a restart.
 
 Routes
 ------
-POST /odisha/chat/stream           — rewrite script.py, run as subprocess, stream SSE.
-POST /odisha/audio/execute         — fire execute/stream with stream_refs, relay SSE.
-WS   /odisha/audio/stream/{id}     — proxy mic audio to upstream audio-streams WS.
-GET  /odisha/health-check          — health probe.
-GET  /                                 — serves chatbot.html.
+APIs are mounted twice so both nginx (strip ``/odisha``) and local browsers work:
+
+* After nginx strips ``/odisha``: ``/chat/stream``, ``/audio/execute``, …
+* Direct / frontend: ``/odisha/chat/stream``, ``/odisha/audio/execute``, …
+
+POST …/chat/stream           — rewrite script.py, run as subprocess, stream SSE.
+POST …/audio/execute         — fire execute/stream with stream_refs, relay SSE.
+WS   …/audio/stream/{id}     — proxy mic audio to upstream audio-streams WS.
+GET  …/health-check          — health probe.
+GET  /                       — serves chatbot.html.
 """
 from __future__ import annotations
 
@@ -28,7 +33,16 @@ from typing import Any
 import requests
 import websockets
 
-from fastapi import FastAPI, File, Form, UploadFile, Request, WebSocket, WebSocketDisconnect
+from fastapi import (
+    APIRouter,
+    FastAPI,
+    File,
+    Form,
+    UploadFile,
+    Request,
+    WebSocket,
+    WebSocketDisconnect,
+)
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -42,8 +56,10 @@ from script_transformer import (
 
 app = FastAPI(title="Chat Workflow Backend", version="1.0.0")
 
-# Public path prefix for all HTTP/WS APIs (shared with the frontend ENDPOINTS).
-_API_PREFIX: str = "/odisha"
+# Browser and frontend ENDPOINTS use this prefix (e.g. /odisha/chat/stream).
+_PUBLIC_API_PREFIX: str = "/odisha"
+# Same handlers also mount at "" so nginx can strip /odisha and forward /chat/stream.
+_api_router = APIRouter()
 
 # ── CORS ──────────────────────────────────────────────────────────────────
 app.add_middleware(
@@ -145,7 +161,7 @@ def _get_script_metadata() -> ScriptMetadata:
 
 
 # ── Health ────────────────────────────────────────────────────────────────
-@app.get(f"{_API_PREFIX}/health-check")
+@_api_router.get("/health-check")
 def health_check() -> dict[str, str]:
     """Return a simple health status.
 
@@ -413,7 +429,7 @@ def _run_script_and_stream(query: str, client_id: str, uploaded_file_path: str |
 
 
 # ── Audio WebSocket Proxy ────────────────────────────────────────────────
-@app.websocket(f"{_API_PREFIX}/audio/stream/{{stream_id}}")
+@_api_router.websocket("/audio/stream/{stream_id}")
 async def audio_stream_proxy(websocket: WebSocket, stream_id: str) -> None:
     """Accept browser binary audio frames and relay them to the upstream
     audio-streams WebSocket endpoint in real time.
@@ -511,7 +527,7 @@ async def audio_stream_proxy(websocket: WebSocket, stream_id: str) -> None:
             pass
 
 
-@app.post(f"{_API_PREFIX}/audio/execute")
+@_api_router.post("/audio/execute")
 async def audio_execute(request: Request, stream_id: str = Form(...)) -> StreamingResponse:
     """Fire POST /execute/stream with stream_refs pointing at ``stream_id``.
 
@@ -650,7 +666,7 @@ def _run_audio_and_stream(stream_id: str, client_id: str):
 
 
 # ── Chat Streaming ────────────────────────────────────────────────────────
-@app.post(f"{_API_PREFIX}/chat/stream")
+@_api_router.post("/chat/stream")
 async def chat_stream(
     request: Request,
     query: str = Form(default=""),
@@ -692,6 +708,12 @@ async def chat_stream(
         },
     )
 
+
+# Mount APIs at "" (nginx after strip) and under /odisha (local / browser).
+assert _PUBLIC_API_PREFIX.startswith("/"), "_PUBLIC_API_PREFIX must start with /"
+assert len(_PUBLIC_API_PREFIX) > 1, "_PUBLIC_API_PREFIX must not be empty"
+app.include_router(_api_router)
+app.include_router(_api_router, prefix=_PUBLIC_API_PREFIX)
 
 # ── Root → Odisha Govt Chatbot (new UI only) ────────────────────────────
 _FRONTEND_DIR: str = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "frontend")

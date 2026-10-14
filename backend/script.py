@@ -1,6 +1,6 @@
 import requests, json
 
-WORKFLOW_KEY = "QXzcrc87z302Q9_rf0j_NnnrRGoFyC54QlIMK_Ef8EA"
+WORKFLOW_KEY = "BZ06rGl66aTLEFxU3q0o_lLnBsF89Lt822ZDA2W_cw4"
 WORKFLOW_ID  = "d9bbbd15-fb8b-432f-b418-754fb6a08ebd"
 BASE_URL     = "https://map-qa.paradigmit.ai/api/v1/agent-workflows"  # change if calling a different environment
 
@@ -88,13 +88,17 @@ print()
 if result is None:
     raise RuntimeError("Stream ended without a complete event")
 
-# ── Step 4: Read output ────────────────────────────────────────────────────
-# Output structure:
+# ── Step 4: Read output (multi-output safe) ───────────────────────────────
+# final_output may include text, audio file, and other named fields together.
+# Use .get so missing keys do not crash; keep the full dict for the UI bridge.
+# Example shape:
 # {
 #     "audio_file_output": "...",
+#     "output": "...",
 # }
 final_output = result["final_output"]
-audio_file_output = final_output["audio_file_output"]
+audio_file_output = final_output.get("audio_file_output")
+output = final_output.get("output")
 
 # ── Optional: retrieve full session history ─────────────────────────────────
 # session_detail = requests.get(
