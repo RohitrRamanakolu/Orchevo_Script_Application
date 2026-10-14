@@ -1,8 +1,8 @@
 /**
  * Odisha Govt Chatbot Client
  * Dual input:
- *   - Text (+ optional attach) via /odisha/api/chat/stream
- *   - Mic: live 16 kHz PCM over WebSocket + /odisha/api/audio/execute
+ *   - Text (+ optional attach) via /odisha/chat/stream
+ *   - Mic: live 16 kHz PCM over WebSocket + /odisha/audio/execute
  *     (stream_refs → audio_stream Start var from script.py, e.g. audio_input_stream)
  * SpeechRecognition shows a live user transcript; SSE relays text/audio replies.
  *
@@ -18,10 +18,10 @@ const WS_BASE = API_BASE.replace(/^https/, "wss").replace(/^http/, "ws");
 /** Must match backend ``_API_PREFIX`` in main.py. */
 const API_PREFIX = "/odisha";
 const ENDPOINTS = Object.freeze({
-  CHAT_STREAM:    `${API_BASE}${API_PREFIX}/api/chat/stream`,
-  AUDIO_EXECUTE:  `${API_BASE}${API_PREFIX}/api/audio/execute`,
-  AUDIO_WS:       (streamId) => `${WS_BASE}${API_PREFIX}/api/audio/stream/${streamId}`,
-  HEALTH:         `${API_BASE}${API_PREFIX}/api/health-check`,
+  CHAT_STREAM:    `${API_BASE}${API_PREFIX}/chat/stream`,
+  AUDIO_EXECUTE:  `${API_BASE}${API_PREFIX}/audio/execute`,
+  AUDIO_WS:       (streamId) => `${WS_BASE}${API_PREFIX}/audio/stream/${streamId}`,
+  HEALTH:         `${API_BASE}${API_PREFIX}/health-check`,
 });
 
 /** Mic / live-stream sample rate required by Paradigm audio_stream STT. */
@@ -1157,7 +1157,7 @@ function _setReplayBarState(replayBar, state, chunkStore) {
 
 /**
  * Set up mic capability detection on page load.
- * Live mic needs getUserMedia + WebSocket to /odisha/api/audio/stream/{id}.
+ * Live mic needs getUserMedia + WebSocket to /odisha/audio/stream/{id}.
  */
 function setupAudioStreaming() {
   if (!btnMic) return;

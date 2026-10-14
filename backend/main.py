@@ -7,10 +7,10 @@ reconfigures the backend without a restart.
 
 Routes
 ------
-POST /odisha/api/chat/stream           — rewrite script.py, run as subprocess, stream SSE.
-POST /odisha/api/audio/execute         — fire execute/stream with stream_refs, relay SSE.
-WS   /odisha/api/audio/stream/{id}     — proxy mic audio to upstream audio-streams WS.
-GET  /odisha/api/health-check          — health probe.
+POST /odisha/chat/stream           — rewrite script.py, run as subprocess, stream SSE.
+POST /odisha/audio/execute         — fire execute/stream with stream_refs, relay SSE.
+WS   /odisha/audio/stream/{id}     — proxy mic audio to upstream audio-streams WS.
+GET  /odisha/health-check          — health probe.
 GET  /                                 — serves chatbot.html.
 """
 from __future__ import annotations
@@ -145,7 +145,7 @@ def _get_script_metadata() -> ScriptMetadata:
 
 
 # ── Health ────────────────────────────────────────────────────────────────
-@app.get(f"{_API_PREFIX}/api/health-check")
+@app.get(f"{_API_PREFIX}/health-check")
 def health_check() -> dict[str, str]:
     """Return a simple health status.
 
@@ -413,13 +413,13 @@ def _run_script_and_stream(query: str, client_id: str, uploaded_file_path: str |
 
 
 # ── Audio WebSocket Proxy ────────────────────────────────────────────────
-@app.websocket(f"{_API_PREFIX}/api/audio/stream/{{stream_id}}")
+@app.websocket(f"{_API_PREFIX}/audio/stream/{{stream_id}}")
 async def audio_stream_proxy(websocket: WebSocket, stream_id: str) -> None:
     """Accept browser binary audio frames and relay them to the upstream
     audio-streams WebSocket endpoint in real time.
 
     The browser:
-      1. Opens this WS first (before calling /odisha/api/audio/execute).
+      1. Opens this WS first (before calling /odisha/audio/execute).
       2. Sends binary audio frames (e.g. Opus/WebM chunks from MediaRecorder).
       3. Sends text frame ``"__end__"`` or closes the socket when done.
 
@@ -511,11 +511,11 @@ async def audio_stream_proxy(websocket: WebSocket, stream_id: str) -> None:
             pass
 
 
-@app.post(f"{_API_PREFIX}/api/audio/execute")
+@app.post(f"{_API_PREFIX}/audio/execute")
 async def audio_execute(request: Request, stream_id: str = Form(...)) -> StreamingResponse:
     """Fire POST /execute/stream with stream_refs pointing at ``stream_id``.
 
-    Call this *after* opening the ``/odisha/api/audio/stream/{stream_id}`` WebSocket
+    Call this *after* opening the ``/odisha/audio/stream/{stream_id}`` WebSocket
     so the upstream workflow engine can consume the live audio queue.
 
     Parameters
@@ -650,7 +650,7 @@ def _run_audio_and_stream(stream_id: str, client_id: str):
 
 
 # ── Chat Streaming ────────────────────────────────────────────────────────
-@app.post(f"{_API_PREFIX}/api/chat/stream")
+@app.post(f"{_API_PREFIX}/chat/stream")
 async def chat_stream(
     request: Request,
     query: str = Form(default=""),
