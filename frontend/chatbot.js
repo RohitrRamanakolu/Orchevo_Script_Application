@@ -56,8 +56,6 @@ let micAudioContext      = null;   // AudioContext for mic capture
 let micSourceNode        = null;   // MediaStreamAudioSourceNode
 let micProcessorNode     = null;   // ScriptProcessorNode (downsamples to 16 kHz)
 let audioStream          = null;   // getUserMedia stream handle (raw tracks)
-let playbackAudioContext = null;   // AudioContext for live streaming PCM16 playback
-let playbackScheduleTime = 0;      // Seconds on the playback clock scheduled so far
 let replayAudioContext   = null;   // AudioContext for replay (kept separate from live stream)
 let fileReplayAudio      = null;   // HTMLAudioElement for audio_file_output_b64 replay
 let userSpeechRecognizer = null;   // Parallel SpeechRecognition for user transcript
@@ -378,19 +376,17 @@ async function sendMessage(query, fileOverride, displayOverride) {
           textContainer.innerHTML = renderMarkdown(tokenBuffer) + '<span class="streaming-cursor"></span>';
           scrollToBottom();
         } else if (evType === "audio_chunk") {
-          // Audio output from a TTS/voice_model node — play it in the browser
+          // Audio from a TTS/voice_model node — buffered; played only on click.
           if (!hasAudioOutput) {
             hasAudioOutput = true;
             if (!hasReceivedToken) {
               hasReceivedToken = true;
-              textContainer.innerHTML = '<p><em>&#127908; Speaking…</em></p>';
+              textContainer.innerHTML = '<p><em>&#127908; Preparing audio…</em></p>';
             }
-            if (btnMic) btnMic.classList.add("speaking");
           }
           handleAudioChunk(eventPayload, chunkStore);
         } else if (evType === "complete") {
           const fo = eventPayload.final_output || {};
-          stopPlayback();
           applyAssistantCompleteOutput({
             finalOutput: fo,
             tokenBuffer,
@@ -426,7 +422,6 @@ async function sendMessage(query, fileOverride, displayOverride) {
     isStreaming = false;
     abortController = null;
     updateSendControls();
-    stopPlayback();
     scrollToBottom();
   }
 }
@@ -661,19 +656,6 @@ function stopAudioStream() {
   audioWs = null;
 }
 
-/** Stop the PCM16 live-stream playback pipeline. */
-function stopPlayback() {
-  if (playbackAudioContext && playbackAudioContext.state !== "closed") {
-    try { playbackAudioContext.close(); } catch {}
-    playbackAudioContext = null;
-  }
-  playbackScheduleTime = 0;
-  if (btnMic) btnMic.classList.remove("speaking");
-  if (!isListening && !isStreaming) {
-    setVoiceStatus(VOICE_STATUS.IDLE);
-  }
-}
-
 /** Stop any active replay (PCM AudioContext or file HTMLAudioElement). */
 function stopReplay() {
   if (replayAudioContext && replayAudioContext.state !== "closed") {
@@ -764,7 +746,7 @@ function playAudioFileUrl(objectUrl, replayBar, durLabel = "…") {
     if (btnMic) btnMic.classList.remove("speaking");
     if (!isListening && !isStreaming) setVoiceStatus(VOICE_STATUS.IDLE);
     _setFileReplayBarState(replayBar, "idle", objectUrl, durLabel);
-    console.error(`Audio autoplay blocked or failed: ${err.message}`);
+    console.error(`Audio playback failed: ${err.message}`);
   });
 }
 
@@ -821,7 +803,6 @@ function _setFileReplayBarState(replayBar, state, objectUrl, durLabel = "…") {
  * @param {HTMLElement} opts.audioReplayContainer
  * @param {Array} opts.chunkStore
  * @param {boolean} opts.hasStreamedAudio
- * @param {boolean} [opts.markSpeaking]
  */
 function applyAssistantCompleteOutput(opts) {
   assert: typeof opts === "object" && opts !== null;
@@ -859,9 +840,6 @@ function applyAssistantCompleteOutput(opts) {
   if (hasFileAudio) {
     try {
       handleAudioFileOutput(finalOutput, audioReplayContainer);
-      if (opts.markSpeaking) {
-        setVoiceStatus(VOICE_STATUS.SPEAKING);
-      }
     } catch (audioErr) {
       const prior = hasText ? textContainer.innerHTML : "";
       textContainer.innerHTML =
@@ -957,72 +935,36 @@ function handleAudioFileOutput(finalOutput, replayBar) {
     _setFileReplayBarState(replayBar, "idle", playableUrl, durLabel);
     replayBar.style.display = "flex";
     scrollToBottom();
-    playAudioFileUrl(playableUrl, replayBar, durLabel);
   };
 
   probe.addEventListener("loadedmetadata", () => {
     reveal(formatAudioDurationLabel(probe.duration));
   });
   probe.addEventListener("error", () => {
-    // Public URLs can fail CORS/metadata probe; still expose Play for a user gesture.
+    // Public URLs can fail CORS/metadata probe; still expose the Play button.
     reveal("?");
   });
 }
 
 /**
- * Decode a base64 PCM16 mono chunk, schedule it for seamless live playback,
- * and optionally push the raw Int16 data into a persistent chunkStore for later replay.
+ * Decode a base64 PCM16 mono chunk and append it to ``chunkStore``.
+ * Audio is NOT played here: playback starts only when the user clicks Play Audio.
  *
  * @param {{ data_b64: string, sample_rate: number }} payload - SSE audio_chunk event
- * @param {Array<{int16: Int16Array, sample_rate: number}> | null} chunkStore
- *   If provided, the decoded Int16Array is appended here so the caller can replay later.
+ * @param {Array<{int16: Int16Array, sample_rate: number}>} chunkStore
+ *   Decoded chunks are appended here for click-to-play replay.
  */
-function handleAudioChunk(payload, chunkStore = null) {
+function handleAudioChunk(payload, chunkStore) {
+  assert: Array.isArray(chunkStore);
   const { data_b64, sample_rate = 24000 } = payload;
   if (!data_b64) return;
 
-  // Decode base64 -> Int16Array
   const binaryStr = atob(data_b64);
   const int16 = new Int16Array(binaryStr.length / 2);
   for (let i = 0; i < int16.length; i++) {
     int16[i] = (binaryStr.charCodeAt(i * 2) | (binaryStr.charCodeAt(i * 2 + 1) << 8));
   }
-
-  // Persist chunk for replay if a store was given
-  if (chunkStore !== null) {
-    chunkStore.push({ int16, sample_rate });
-  }
-
-  // ── Live streaming playback ──
-  if (!playbackAudioContext || playbackAudioContext.state === "closed") {
-    playbackAudioContext = new (window.AudioContext || window.webkitAudioContext)({
-      sampleRate: sample_rate,
-    });
-    playbackScheduleTime = playbackAudioContext.currentTime + 0.05;
-    btnMic.classList.add("speaking");
-  }
-
-  const numSamples = int16.length;
-  const audioBuffer = playbackAudioContext.createBuffer(1, numSamples, sample_rate);
-  const channelData = audioBuffer.getChannelData(0);
-  for (let i = 0; i < numSamples; i++) {
-    channelData[i] = int16[i] / 32768.0;
-  }
-
-  const bufferSource = playbackAudioContext.createBufferSource();
-  bufferSource.buffer = audioBuffer;
-  bufferSource.connect(playbackAudioContext.destination);
-
-  const now = playbackAudioContext.currentTime;
-  const startAt = Math.max(now + 0.01, playbackScheduleTime);
-  bufferSource.start(startAt);
-  playbackScheduleTime = startAt + audioBuffer.duration;
-
-  bufferSource.onended = () => {
-    if (playbackAudioContext && playbackScheduleTime <= playbackAudioContext.currentTime + 0.05) {
-      btnMic.classList.remove("speaking");
-    }
-  };
+  chunkStore.push({ int16, sample_rate });
 }
 
 /**
@@ -1294,15 +1236,12 @@ async function toggleAudioStream() {
               hasAudioOutput = true;
               if (!hasReceivedToken) {
                 hasReceivedToken = true;
-                textContainer.innerHTML = '<p><em>&#127908; Speaking…</em></p>';
+                textContainer.innerHTML = '<p><em>&#127908; Preparing audio…</em></p>';
               }
-              if (btnMic) btnMic.classList.add("speaking");
-              setVoiceStatus(VOICE_STATUS.SPEAKING);
             }
             handleAudioChunk(payload, chunkStore);
           } else if (evType === "complete") {
             const fo = payload.final_output || {};
-            stopPlayback();
             applyAssistantCompleteOutput({
               finalOutput: fo,
               tokenBuffer,
@@ -1310,7 +1249,6 @@ async function toggleAudioStream() {
               audioReplayContainer,
               chunkStore,
               hasStreamedAudio: hasAudioOutput,
-              markSpeaking: true,
             });
             scrollToBottom();
           } else if (evType === "error") {
