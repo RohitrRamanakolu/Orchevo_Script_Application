@@ -217,9 +217,9 @@ function appendUserMessage(text, file = null) {
 }
 
 /**
- * Create an Assistant response card with clean response area and citation section.
+ * Create an Assistant response card with text area and optional audio replay.
  *
- * @returns {{ row: HTMLElement, textContainer: HTMLElement, citationSection: HTMLElement, audioReplayContainer: HTMLElement }}
+ * @returns {{ row: HTMLElement, textContainer: HTMLElement, audioReplayContainer: HTMLElement }}
  */
 function createAssistantCard() {
   const rowEl = document.createElement("div");
@@ -237,18 +237,12 @@ function createAssistantCard() {
     </div>
   `;
 
-  // Citations & Sources container (hidden until content arrives)
-  const citationSection = document.createElement("div");
-  citationSection.className = "citation-section";
-  citationSection.style.display = "none";
-
   // Audio replay toolbar (hidden until audio response completes)
   const audioReplayContainer = document.createElement("div");
   audioReplayContainer.className = "audio-replay-bar";
   audioReplayContainer.style.display = "none";
 
   cardEl.appendChild(textContainer);
-  cardEl.appendChild(citationSection);
   cardEl.appendChild(audioReplayContainer);
 
   rowEl.innerHTML = `<div class="msg-avatar-ai">AI</div>`;
@@ -256,93 +250,8 @@ function createAssistantCard() {
   messagesList.appendChild(rowEl);
   scrollToBottom();
 
-  return { row: rowEl, textContainer, citationSection, audioReplayContainer };
+  return { row: rowEl, textContainer, audioReplayContainer };
 }
-
-/**
- * Populate citations in the assistant card.
- * @param {HTMLElement} citationSection 
- * @param {string} text - Final text of the response
- * @param {File | null} file - Uploaded file if any
- */
-function updateCitations(citationSection, text, file) {
-  if (!citationSection) return;
-
-  const citations = [];
-
-  // If a file was attached in this query turn, include it as primary document source
-  if (file) {
-    citations.push({
-      tag: `[Doc 1]`,
-      title: file.name,
-      snippet: `User uploaded document (${formatFileSize(file.size)}) referenced for workflow context.`
-    });
-  }
-
-  // Authoritative workflow grounding context
-  const mainTag = citations.length === 0 ? "[1]" : `[${citations.length + 1}]`;
-  citations.push({
-    tag: mainTag,
-    title: "Odisha Government Agent Workflow Knowledge Base",
-    snippet: "Authoritative ground truth retrieved from active agent workflow execution."
-  });
-
-  // Extract any markdown links or URLs from the text if present
-  const linkRegex = /\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g;
-  let match;
-  let linkIdx = citations.length + 1;
-  while ((match = linkRegex.exec(text)) !== null && linkIdx <= 5) {
-    citations.push({
-      tag: `[${linkIdx}]`,
-      title: match[1],
-      snippet: `<a href="${escapeHtml(match[2])}" target="_blank" rel="noopener noreferrer">${escapeHtml(match[2])}</a>`
-    });
-    linkIdx++;
-  }
-
-  let itemsHtml = "";
-  citations.forEach(c => {
-    itemsHtml += `
-      <div class="citation-item">
-        <div class="citation-item-header">
-          <span class="citation-tag">${escapeHtml(c.tag)}</span>
-          <span class="citation-source-name">${escapeHtml(c.title)}</span>
-        </div>
-        <div class="citation-snippet">${c.snippet}</div>
-      </div>
-    `;
-  });
-
-  const countText = citations.length === 1 ? "1 source" : `${citations.length} sources`;
-
-  citationSection.innerHTML = `
-    <button class="btn-citation-toggle" type="button" onclick="toggleCitations(this)">
-      <div class="citation-toggle-left">
-        <span class="citation-icon">📚</span>
-        <span class="citation-label">Sources &amp; Citations</span>
-        <span class="citation-count-badge">${countText}</span>
-      </div>
-      <span class="citation-chevron">▾</span>
-    </button>
-    <div class="citation-panel">
-      ${itemsHtml}
-    </div>
-  `;
-
-  citationSection.style.display = "flex";
-}
-
-/**
- * Toggle citation drawer open/closed.
- * @param {HTMLButtonElement} btn 
- */
-window.toggleCitations = function(btn) {
-  const section = btn.closest(".citation-section");
-  if (section) {
-    section.classList.toggle("open");
-    scrollToBottom();
-  }
-};
 
 /**
  * Display error alert card with retry option.
@@ -405,7 +314,7 @@ async function sendMessage(query, fileOverride, displayOverride) {
     clearAttachedFile();
   }
 
-  const { textContainer, citationSection, audioReplayContainer } = createAssistantCard();
+  const { textContainer, audioReplayContainer } = createAssistantCard();
 
 
   let tokenBuffer = "";
@@ -470,44 +379,26 @@ async function sendMessage(query, fileOverride, displayOverride) {
           scrollToBottom();
         } else if (evType === "audio_chunk") {
           // Audio output from a TTS/voice_model node — play it in the browser
-          if (!hasReceivedToken && !hasAudioOutput) {
-            hasReceivedToken = true;
+          if (!hasAudioOutput) {
             hasAudioOutput = true;
-            textContainer.innerHTML = '<p><em>&#127908; Speaking…</em></p>';
-            btnMic.classList.add("speaking");
+            if (!hasReceivedToken) {
+              hasReceivedToken = true;
+              textContainer.innerHTML = '<p><em>&#127908; Speaking…</em></p>';
+            }
+            if (btnMic) btnMic.classList.add("speaking");
           }
           handleAudioChunk(eventPayload, chunkStore);
         } else if (evType === "complete") {
           const fo = eventPayload.final_output || {};
-          const finalResult =
-            typeof fo.output === "string" && fo.output.length > 0
-              ? fo.output
-              : tokenBuffer;
           stopPlayback();
-
-          if (hasAudioOutput && chunkStore.length > 0) {
-            textContainer.innerHTML = "";
-            showAudioReplayButton(audioReplayContainer, chunkStore);
-          } else if (hasAudioFileResponse(fo)) {
-            if (finalResult) {
-              textContainer.innerHTML = renderMarkdown(finalResult);
-              updateCitations(citationSection, finalResult, fileToSend);
-            } else {
-              textContainer.innerHTML = "<p><em>&#127908; Audio response</em></p>";
-            }
-            try {
-              handleAudioFileOutput(fo, audioReplayContainer);
-            } catch (audioErr) {
-              textContainer.innerHTML =
-                `<p class="error-inline">Could not play audio response: ${audioErr.message}</p>`;
-            }
-          } else if (finalResult) {
-            textContainer.innerHTML = renderMarkdown(finalResult);
-            updateCitations(citationSection, finalResult, fileToSend);
-          } else {
-            textContainer.innerHTML =
-              "<p class=\"error-inline\">Workflow completed with no text or audio output.</p>";
-          }
+          applyAssistantCompleteOutput({
+            finalOutput: fo,
+            tokenBuffer,
+            textContainer,
+            audioReplayContainer,
+            chunkStore,
+            hasStreamedAudio: hasAudioOutput,
+          });
           scrollToBottom();
         } else if (evType === "error") {
           throw new Error(eventPayload.detail || "Workflow execution encountered an unexpected error.");
@@ -518,14 +409,12 @@ async function sendMessage(query, fileOverride, displayOverride) {
     // Clean up cursor if finished cleanly
     if (!hasAudioOutput && tokenBuffer && textContainer.querySelector(".streaming-cursor")) {
       textContainer.innerHTML = renderMarkdown(tokenBuffer);
-      updateCitations(citationSection, tokenBuffer, fileToSend);
     }
 
   } catch (err) {
     if (err.name === "AbortError") {
       if (tokenBuffer) {
         textContainer.innerHTML = renderMarkdown(tokenBuffer);
-        updateCitations(citationSection, tokenBuffer, fileToSend);
       } else {
         textContainer.innerHTML = "<p><em>Generation stopped by user.</em></p>";
       }
@@ -898,6 +787,67 @@ function _setFileReplayBarState(replayBar, state, objectUrl, durLabel = "…") {
   replayBar.querySelector(".btn-audio-replay").addEventListener("click", () => {
     playAudioFileUrl(objectUrl, replayBar, durLabel);
   });
+}
+
+/**
+ * Render text and voice together from a workflow ``complete`` payload.
+ * Multi-output turns keep both: markdown text plus stream and/or file audio.
+ *
+ * @param {object} opts
+ * @param {Record<string, unknown>} opts.finalOutput
+ * @param {string} opts.tokenBuffer
+ * @param {HTMLElement} opts.textContainer
+ * @param {HTMLElement} opts.audioReplayContainer
+ * @param {Array} opts.chunkStore
+ * @param {boolean} opts.hasStreamedAudio
+ * @param {boolean} [opts.markSpeaking]
+ */
+function applyAssistantCompleteOutput(opts) {
+  assert: typeof opts === "object" && opts !== null;
+  const finalOutput = opts.finalOutput && typeof opts.finalOutput === "object"
+    ? opts.finalOutput
+    : {};
+  const tokenBuffer = typeof opts.tokenBuffer === "string" ? opts.tokenBuffer : "";
+  const textContainer = opts.textContainer;
+  const audioReplayContainer = opts.audioReplayContainer;
+  const chunkStore = Array.isArray(opts.chunkStore) ? opts.chunkStore : [];
+  assert: textContainer instanceof HTMLElement;
+  assert: audioReplayContainer instanceof HTMLElement;
+
+  const finalText =
+    typeof finalOutput.output === "string" && finalOutput.output.length > 0
+      ? finalOutput.output
+      : tokenBuffer;
+  const hasText = typeof finalText === "string" && finalText.trim().length > 0;
+  const hasStreamAudio = Boolean(opts.hasStreamedAudio) && chunkStore.length > 0;
+  const hasFileAudio = hasAudioFileResponse(finalOutput);
+
+  if (hasText) {
+    textContainer.innerHTML = renderMarkdown(finalText);
+  } else if (hasStreamAudio || hasFileAudio) {
+    textContainer.innerHTML = "<p><em>&#127908; Audio response</em></p>";
+  } else {
+    textContainer.innerHTML =
+      "<p class=\"error-inline\">Workflow completed with no text or audio output.</p>";
+  }
+
+  if (hasStreamAudio) {
+    showAudioReplayButton(audioReplayContainer, chunkStore);
+  }
+
+  if (hasFileAudio) {
+    try {
+      handleAudioFileOutput(finalOutput, audioReplayContainer);
+      if (opts.markSpeaking) {
+        setVoiceStatus(VOICE_STATUS.SPEAKING);
+      }
+    } catch (audioErr) {
+      const prior = hasText ? textContainer.innerHTML : "";
+      textContainer.innerHTML =
+        prior +
+        `<p class="error-inline">Could not play audio response: ${audioErr.message}</p>`;
+    }
+  }
 }
 
 /**
@@ -1276,7 +1226,7 @@ async function toggleAudioStream() {
         : "Voice message (transcript unavailable)";
     appendUserMessage(displayText, null);
 
-    const { textContainer, citationSection, audioReplayContainer } = createAssistantCard();
+    const { textContainer, audioReplayContainer } = createAssistantCard();
     let tokenBuffer = "";
     let hasReceivedToken = false;
     let hasAudioOutput = false;
@@ -1319,46 +1269,28 @@ async function toggleAudioStream() {
             textContainer.innerHTML = renderMarkdown(tokenBuffer) + '<span class="streaming-cursor"></span>';
             scrollToBottom();
           } else if (evType === "audio_chunk") {
-            if (!hasReceivedToken && !hasAudioOutput) {
-              hasReceivedToken = true;
+            if (!hasAudioOutput) {
               hasAudioOutput = true;
-              textContainer.innerHTML = '<p><em>&#127908; Speaking…</em></p>';
+              if (!hasReceivedToken) {
+                hasReceivedToken = true;
+                textContainer.innerHTML = '<p><em>&#127908; Speaking…</em></p>';
+              }
               if (btnMic) btnMic.classList.add("speaking");
               setVoiceStatus(VOICE_STATUS.SPEAKING);
             }
             handleAudioChunk(payload, chunkStore);
           } else if (evType === "complete") {
             const fo = payload.final_output || {};
-            const final =
-              typeof fo.output === "string" && fo.output.length > 0
-                ? fo.output
-                : tokenBuffer;
             stopPlayback();
-
-            if (hasAudioOutput && chunkStore.length > 0) {
-              textContainer.innerHTML = "";
-              showAudioReplayButton(audioReplayContainer, chunkStore);
-            } else if (hasAudioFileResponse(fo)) {
-              if (final) {
-                textContainer.innerHTML = renderMarkdown(final);
-                updateCitations(citationSection, final, null);
-              } else {
-                textContainer.innerHTML = "<p><em>&#127908; Audio response</em></p>";
-              }
-              try {
-                handleAudioFileOutput(fo, audioReplayContainer);
-                setVoiceStatus(VOICE_STATUS.SPEAKING);
-              } catch (audioErr) {
-                textContainer.innerHTML =
-                  `<p class="error-inline">Could not play audio response: ${audioErr.message}</p>`;
-              }
-            } else if (final) {
-              textContainer.innerHTML = renderMarkdown(final);
-              updateCitations(citationSection, final, null);
-            } else {
-              textContainer.innerHTML =
-                "<p class=\"error-inline\">Workflow completed with no text or audio output.</p>";
-            }
+            applyAssistantCompleteOutput({
+              finalOutput: fo,
+              tokenBuffer,
+              textContainer,
+              audioReplayContainer,
+              chunkStore,
+              hasStreamedAudio: hasAudioOutput,
+              markSpeaking: true,
+            });
             scrollToBottom();
           } else if (evType === "error") {
             throw new Error(payload.detail || "Audio workflow error");
@@ -1368,7 +1300,6 @@ async function toggleAudioStream() {
 
       if (tokenBuffer && textContainer.querySelector(".streaming-cursor")) {
         textContainer.innerHTML = renderMarkdown(tokenBuffer);
-        updateCitations(citationSection, tokenBuffer, null);
       }
     } catch (err) {
       textContainer.innerHTML = "";
