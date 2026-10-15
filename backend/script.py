@@ -1,4 +1,4 @@
-"""Client for the published DEV workflow "odisha wss voice and chat tool".
+"""Client for the published DEV workflow "odisha wss voice and chat flash" (runs gemini-4-argon).
 
 Ask by text or by voice; every answer comes back as text (`output`) AND speech
 (`audio_file_output`, saved to answer.wav). Reuse one session per conversation.
@@ -17,8 +17,8 @@ import json
 
 import requests
 
-WORKFLOW_KEY = "lEqkx1fZJjDLrrMaiQ7jhUNjWrTFXBvzmP7icLnt8jo"
-WORKFLOW_ID = "73f8ba49-9775-438e-845e-127b89d53372"
+WORKFLOW_KEY = "1WvPNykBSoGxDuh1eLhC-TpVRKCacfnBPPQdCfhFhOE"
+WORKFLOW_ID = "37cdac50-cde1-41bc-8e6d-ff22a8525f2c"
 BASE_URL = "https://map-dev.paradigmit.ai/api/v1/agent-workflows"
 HEADERS = {"X-Workflow-Key": WORKFLOW_KEY}
 ANSWER_AUDIO_PATH = "answer.wav"
@@ -75,4 +75,5 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
  
