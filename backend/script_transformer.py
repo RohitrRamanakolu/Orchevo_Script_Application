@@ -134,6 +134,35 @@ def _extract_dict_str_keys(dict_node: ast.Dict) -> list[str]:
     return [v for key in dict_node.keys if (v := _const_value(key)) is not None]
 
 
+def _json_dumps_dict_literals(node: ast.expr) -> list[ast.Dict]:
+    """Return dict literals passed to ``json.dumps(...)`` in ``node``.
+
+    Handles ``json.dumps({...})`` and ``json.dumps({...} if cond else {...})``.
+
+    Parameters
+    ----------
+    node : ast.expr
+        Expression expected to be a ``json.dumps(...)`` call.
+
+    Returns
+    -------
+    list[ast.Dict]
+        Dict literal nodes; empty when ``node`` is not such a call.
+    """
+    assert isinstance(node, ast.expr), "Expected ast.expr node"
+    is_dumps_call = (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "dumps"
+        and len(node.args) >= 1
+    )
+    if not is_dumps_call:
+        return []
+    argument = node.args[0]
+    candidates = [argument.body, argument.orelse] if isinstance(argument, ast.IfExp) else [argument]
+    return [candidate for candidate in candidates if isinstance(candidate, ast.Dict)]
+
+
 # ── Introspection ─────────────────────────────────────────────────────────────
 
 class _MetadataExtractor(ast.NodeVisitor):
@@ -174,6 +203,25 @@ class _MetadataExtractor(ast.NodeVisitor):
             # e.g. audio_file_output = final_output["audio_file_output"]
             self.has_audio_file_output = True
 
+        self.generic_visit(node)
+
+    def visit_Dict(self, node: ast.Dict) -> None:  # noqa: N802
+        """Capture text Start keys from inline ``{"inputs": json.dumps({...})}``.
+
+        Published CLI clients build the execute form data inline instead of
+        assigning ``inputs = {...}``. Keys are read from every dict literal
+        inside ``json.dumps`` (including both branches of ``a if x else b``).
+        An explicit ``inputs = {...}`` assignment seen earlier takes priority.
+        """
+        assert isinstance(node, ast.Dict), "Expected ast.Dict node"
+        for key_node, value_node in zip(node.keys, node.values):
+            if key_node is None or _const_value(key_node) != "inputs":
+                continue
+            inline_keys: list[str] = []
+            for literal in _json_dumps_dict_literals(value_node):
+                inline_keys.extend(_extract_dict_str_keys(literal))
+            if inline_keys and not self.caller_input_keys:
+                self.caller_input_keys = list(dict.fromkeys(inline_keys))
         self.generic_visit(node)
 
     def visit_keyword(self, node: ast.keyword) -> None:  # noqa: N802
@@ -373,6 +421,42 @@ def resolve_audio_stream_var_name(meta: ScriptMetadata) -> str:
         "a stream_refs dict nor a files={...} multipart variable. Re-export a "
         "workflow whose Start node declares an audio_stream (or audio_file) input."
     )
+
+
+def resolve_text_input_var_name(meta: ScriptMetadata) -> str:
+    """Return the Start-variable name that receives the user's text query.
+
+    Resolution order (same rules the AST rewriter uses):
+
+    1. First name from ``_QUERY_VAR_PRIORITY`` present in ``meta.caller_input_keys``.
+    2. First declared ``inputs`` key.
+    3. Canonical Paradigm text Start variable (``_QUERY_VAR_PRIORITY[0]``) when
+       the script declares no text inputs (typical for audio-export snippets).
+
+    Parameters
+    ----------
+    meta : ScriptMetadata
+        Metadata produced by ``inspect_script``.
+
+    Returns
+    -------
+    str
+        Non-empty input variable name for ``inputs={name: query}``.
+
+    Raises
+    ------
+    TypeError
+        If ``meta`` is not a ``ScriptMetadata`` instance.
+    """
+    assert isinstance(meta, ScriptMetadata), "meta must be a ScriptMetadata instance"
+    for priority_name in _QUERY_VAR_PRIORITY:
+        if priority_name in meta.caller_input_keys:
+            return priority_name
+    if meta.caller_input_keys:
+        return meta.caller_input_keys[0]
+    canonical_name = _QUERY_VAR_PRIORITY[0]
+    assert canonical_name, "canonical text Start variable must be non-empty"
+    return canonical_name
 
 
 # ── Rewriting ─────────────────────────────────────────────────────────────────

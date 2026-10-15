@@ -56,31 +56,43 @@
   padding: 0;
 }
 
+html, body {
+  height: 100%;
+  max-height: 100%;
+}
+
 body {
   font-family: var(--font-body);
   background-color: var(--bg-floor);
   color: var(--text-primary);
-  min-height: 100vh;
+  height: 100vh;
+  height: 100dvh;
+  max-height: 100vh;
+  max-height: 100dvh;
   display: flex;
   flex-direction: column;
   line-height: 1.5;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
-  overflow-x: hidden;
+  overflow: hidden;
 }
 
 /* ── App Shell ─────────────────────────────────────────────────────────── */
 .nexus-app {
   display: flex;
   flex-direction: column;
-  min-height: 100vh;
+  flex: 1 1 auto;
+  height: 100%;
+  max-height: 100%;
+  min-height: 0;
   position: relative;
+  overflow: hidden;
 }
 
 /* ── Minimalist Top Header ─────────────────────────────────────────────── */
 .top-header {
-  position: sticky;
-  top: 0;
+  position: relative;
+  flex: 0 0 auto;
   z-index: 50;
   height: var(--header-height);
   background: var(--surface-glass);
@@ -220,13 +232,16 @@ body {
 
 /* ── Chat Main Viewport ────────────────────────────────────────────────── */
 .chat-viewport {
-  flex: 1;
+  flex: 1 1 0;
+  min-height: 0; /* required for flex child to scroll instead of grow page */
+  overflow-x: hidden;
   overflow-y: auto;
+  overscroll-behavior: contain;
   display: flex;
   flex-direction: column;
   align-items: center;
   padding: 32px 20px 190px 20px;
-  scroll-behavior: smooth;
+  scroll-behavior: auto;
 }
 
 .chat-container {

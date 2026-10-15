@@ -1,9 +1,12 @@
-"""FastAPI backend that executes Paradigm Platform workflow scripts as subprocesses.
+"""FastAPI backend that runs published Paradigm Platform workflows for the chatbot UI.
 
-Credentials (WORKFLOW_KEY, WORKFLOW_ID, BASE_URL) and input/output metadata are
-introspected dynamically from ``script.py`` on every request via
-``script_transformer.inspect_script`` — dropping a new ``script.py`` automatically
-reconfigures the backend without a restart.
+Credentials (WORKFLOW_KEY, WORKFLOW_ID, BASE_URL) and input names (text query,
+audio Start variable) are introspected from ``script.py`` on every request via
+``script_transformer.inspect_script``. ``script.py`` is never executed: the backend
+creates/reuses a platform session and calls ``POST /execute/stream`` itself, so any
+published client (linear snippet or CLI-style with ``create_session()``/``ask()``)
+works as long as it declares the constants and the ``query`` / audio variables.
+Dropping a new ``script.py`` reconfigures the backend without a restart.
 
 Routes
 ------
@@ -12,7 +15,7 @@ APIs are mounted twice so both nginx (strip ``/odisha``) and local browsers work
 * After nginx strips ``/odisha``: ``/chat/stream``, ``/audio/execute``, …
 * Direct / frontend: ``/odisha/chat/stream``, ``/odisha/audio/execute``, …
 
-POST …/chat/stream           — rewrite script.py, run as subprocess, stream SSE.
+POST …/chat/stream           — text and/or file turn: call execute/stream, relay SSE.
 POST …/audio/execute         — fire execute/stream with stream_refs, relay SSE.
 WS   …/audio/stream/{id}     — proxy mic audio to upstream audio-streams WS.
 GET  …/health-check          — health probe.
@@ -22,12 +25,11 @@ from __future__ import annotations
 
 import asyncio
 import json
+import mimetypes
 import os
-import subprocess
-import sys
 import tempfile
-import traceback
 import uuid
+from collections.abc import Iterator
 from typing import Any
 
 import requests
@@ -50,7 +52,7 @@ from fastapi.staticfiles import StaticFiles
 from script_transformer import (
     inspect_script,
     resolve_audio_stream_var_name,
-    rewrite_script,
+    resolve_text_input_var_name,
     ScriptMetadata,
 )
 
@@ -75,65 +77,24 @@ _SCRIPT_PATH: str = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sc
 # In-memory session store mapping frontend client IPs to platform session IDs
 _SESSIONS: dict[str, str] = {}
 
-# Stdout marker emitted by script.py to carry the full final_output JSON payload
-# (including base64 audio data) back to the subprocess runner.
-_FINAL_OUTPUT_MARKER: str = "__FINAL_OUTPUT__:"
-
-# Byte size for each non-blocking stdout read. Large __FINAL_OUTPUT__ lines
-# (base64 audio) routinely exceed this, so the reader must reassemble across reads.
-_STDOUT_READ_SIZE: int = 4096
-
 # Max characters of an upstream error body to include in raised exceptions.
 _UPSTREAM_ERROR_BODY_LIMIT: int = 500
 
+# Seconds to wait for Paradigm session creation.
+_UPSTREAM_SESSION_TIMEOUT_S: int = 15
 
-def _parse_final_output_marker_line(stripped_line: str) -> dict[str, Any] | None:
-    """Parse a complete ``__FINAL_OUTPUT__:<json>`` line into a dict.
+# Seconds allowed between bytes on the execute/stream response (matches published clients).
+_UPSTREAM_EXECUTE_TIMEOUT_S: int = 900
 
-    Parameters
-    ----------
-    stripped_line:
-        One stdout line with leading/trailing whitespace already removed.
-        Must start with ``_FINAL_OUTPUT_MARKER``.
+# Session labels shown in the Paradigm console, one per entry point.
+_SESSION_NAME_CHAT: str = "Chat session"
+_SESSION_NAME_AUDIO: str = "Audio session"
 
-    Returns
-    -------
-    dict[str, Any] | None
-        Parsed JSON object, or ``None`` when the JSON is not yet valid.
+# Content type for uploads whose type cannot be guessed from the file name.
+_DEFAULT_UPLOAD_MIMETYPE: str = "application/octet-stream"
 
-    Raises
-    ------
-    AssertionError
-        If ``stripped_line`` does not start with the marker.
-    """
-    assert isinstance(stripped_line, str), "stripped_line must be a string"
-    assert stripped_line.startswith(_FINAL_OUTPUT_MARKER), (
-        f"Expected marker prefix {_FINAL_OUTPUT_MARKER!r}, got {stripped_line[:40]!r}"
-    )
-    json_part = stripped_line[len(_FINAL_OUTPUT_MARKER) :]
-    try:
-        payload = json.loads(json_part)
-    except json.JSONDecodeError:
-        return None
-    assert isinstance(payload, dict), (
-        f"__FINAL_OUTPUT__ payload must be a JSON object, got {type(payload).__name__}"
-    )
-    return payload
-
-
-def _is_final_output_line_prefix(text: str) -> bool:
-    """Return True if ``text`` is a full or incomplete ``__FINAL_OUTPUT__`` line.
-
-    Used to hold partial stdout across ``os.read`` boundaries so base64 audio
-    is never forwarded as SSE token events.
-    """
-    assert isinstance(text, str), "text must be a string"
-    stripped = text.lstrip()
-    if not stripped:
-        return False
-    if stripped.startswith(_FINAL_OUTPUT_MARKER):
-        return True
-    return _FINAL_OUTPUT_MARKER.startswith(stripped)
+# Sample rate (Hz) assumed for audio_chunk events that omit ``sample_rate``.
+_DEFAULT_AUDIO_SAMPLE_RATE: int = 24000
 
 
 def _get_script_metadata() -> ScriptMetadata:
@@ -217,213 +178,247 @@ def _raise_for_upstream_status(resp: requests.Response, context: str) -> None:
     )
 
 
-def _files_map_for_upload(meta: ScriptMetadata, uploaded_file_path: str) -> dict[str, str]:
-    """Build the ``files`` map for ``rewrite_script`` from script metadata.
+def _session_cache_key(client_id: str, meta: ScriptMetadata) -> str:
+    """Key the session cache by client AND workflow.
+
+    Swapping ``script.py`` to a different workflow must not reuse a session that
+    belongs to the previous workflow.
+
+    Parameters
+    ----------
+    client_id : str
+        Identifier of the browser client (its IP).
+    meta : ScriptMetadata
+        Metadata whose ``workflow_id`` scopes the session.
+
+    Returns
+    -------
+    str
+        ``"<client_id>:<workflow_id>"``.
+    """
+    assert isinstance(client_id, str) and client_id, "client_id must be non-empty"
+    assert isinstance(meta, ScriptMetadata) and meta.workflow_id, "meta needs a workflow_id"
+    return f"{client_id}:{meta.workflow_id}"
+
+
+def _ensure_session_id(meta: ScriptMetadata, client_id: str, session_name: str) -> str:
+    """Return the cached platform session for this client, creating one if needed.
 
     Parameters
     ----------
     meta : ScriptMetadata
-        Introspected script metadata (must declare at least one file var).
-    uploaded_file_path : str
-        Absolute path to the temporary uploaded file on disk.
+        Credentials and ``base_url`` introspected from ``script.py``.
+    client_id : str
+        Identifier of the browser client (its IP).
+    session_name : str
+        Label for a newly created session.
 
     Returns
     -------
-    dict[str, str]
-        Mapping ``{start_var_name: local_path}`` for AST rewriting.
+    str
+        Paradigm ``session_id``.
 
     Raises
     ------
-    ValueError
-        If ``script.py`` declares no multipart file variables.
+    RuntimeError
+        If session creation is rejected (e.g. invalid or expired workflow key).
     """
-    assert isinstance(meta, ScriptMetadata), "meta must be ScriptMetadata"
-    assert isinstance(uploaded_file_path, str) and uploaded_file_path, \
-        "uploaded_file_path must be a non-empty string"
-    assert os.path.isfile(uploaded_file_path), \
-        f"uploaded file does not exist: {uploaded_file_path}"
+    assert isinstance(session_name, str) and session_name, "session_name must be non-empty"
+    assert meta.base_url, "BASE_URL not found in script.py"
+    cache_key = _session_cache_key(client_id, meta)
+    cached_session_id = _SESSIONS.get(cache_key)
+    if cached_session_id:
+        return cached_session_id
 
-    if not meta.file_var_names:
-        raise ValueError(
-            "An uploaded file was provided, but script.py declares no "
-            "files={...} multipart variables to bind it to."
-        )
-    # Prefer stream/input Start vars over TTS output names (same ranking as live mic).
-    bind_name = resolve_audio_stream_var_name(meta)
-    assert isinstance(bind_name, str) and bind_name, "bind_name must be non-empty"
-    return {bind_name: uploaded_file_path}
+    resp = requests.post(
+        f"{meta.base_url}/sessions",
+        json={"workflow_id": meta.workflow_id, "name": session_name},
+        headers={"X-Workflow-Key": meta.workflow_key},
+        timeout=_UPSTREAM_SESSION_TIMEOUT_S,
+    )
+    _raise_for_upstream_status(resp, "session create")
+    session_id = resp.json()["session_id"]
+    assert isinstance(session_id, str) and session_id, "session_id must be a non-empty string"
+    _SESSIONS[cache_key] = session_id
+    return session_id
 
 
-def _run_script_and_stream(query: str, client_id: str, uploaded_file_path: str | None = None):
-    """Read script.py, substitute the query, run it, and yield SSE events.
-
-    The script's stdout (token prints) is streamed to the client in
-    real time as ``token`` events. When the process finishes, a
-    ``complete`` or ``error`` event is emitted.
+def _post_execute_stream(
+    meta: ScriptMetadata,
+    data: dict[str, str],
+    files: dict[str, tuple[str, Any, str]] | None = None,
+) -> requests.Response:
+    """POST ``/execute/stream`` to Paradigm and return the open streaming response.
 
     Parameters
     ----------
-    query : str
-        The user's chat message to inject into the script.
-    client_id : str
-        Identifier for the user to persist session across turns.
-    uploaded_file_path: str | None
-        Path to temporary uploaded file if any.
+    meta : ScriptMetadata
+        Credentials and ``base_url`` introspected from ``script.py``.
+    data : dict[str, str]
+        Form fields (``inputs``, ``workflow_id``, ``session_id``, optional ``stream_refs``).
+    files : dict | None
+        Optional multipart upload ``{start_var: (filename, handle, mimetype)}``.
+
+    Returns
+    -------
+    requests.Response
+        Streaming response ready for ``iter_lines()``.
+
+    Raises
+    ------
+    RuntimeError
+        If Paradigm answers with a non-2xx status.
+    """
+    assert meta.base_url, "BASE_URL not found in script.py"
+    assert "workflow_id" in data and "session_id" in data, "data needs workflow_id and session_id"
+    resp = requests.post(
+        f"{meta.base_url}/execute/stream",
+        data=data,
+        files=files,
+        headers={"X-Workflow-Key": meta.workflow_key},
+        stream=True,
+        timeout=_UPSTREAM_EXECUTE_TIMEOUT_S,
+    )
+    _raise_for_upstream_status(resp, "execute/stream")
+    return resp
+
+
+def _relay_execute_stream(resp: requests.Response, cache_key: str) -> Iterator[str]:
+    """Relay Paradigm ``execute/stream`` events to the browser as SSE lines.
+
+    Handles text (``token``), streamed audio (``audio_chunk``) and the final
+    payload (``complete``). The full ``final_output`` is forwarded so the UI can
+    show ``output`` text and play ``audio_file_output_b64`` together.
+
+    Parameters
+    ----------
+    resp : requests.Response
+        Open streaming response from ``/execute/stream``.
+    cache_key : str
+        ``_SESSIONS`` key to refresh when the platform reports a session id.
 
     Yields
     ------
     str
-        SSE-formatted text lines.
+        SSE ``data:`` lines. The caller appends ``data: [DONE]``.
+
+    Raises
+    ------
+    RuntimeError
+        If the upstream stream ends without a ``complete`` or ``error`` event.
     """
-    assert isinstance(query, str), "Query must be a string"
-    assert os.path.isfile(_SCRIPT_PATH), f"script.py not found at {_SCRIPT_PATH}"
+    assert resp is not None, "upstream response must not be None"
+    assert isinstance(cache_key, str) and cache_key, "cache_key must be non-empty"
+    token_buffer: list[str] = []
+    finished = False
+    for raw_line in resp.iter_lines():
+        if not raw_line:
+            continue
+        line = raw_line.decode() if isinstance(raw_line, bytes) else raw_line
+        if line == "data: [DONE]":
+            break
+        if not line.startswith("data:"):
+            continue
+        event = json.loads(line[5:].strip())
+        event_name = event.get("event")
+        if event_name == "session":
+            new_session_id = event.get("session_id")
+            if new_session_id:
+                _SESSIONS[cache_key] = new_session_id
+        elif event_name == "token":
+            token_buffer.append(event.get("token", ""))
+            yield _build_sse_line({"event": "token", "token": event.get("token", "")})
+        elif event_name == "audio_chunk":
+            yield _build_sse_line({
+                "event": "audio_chunk",
+                "data_b64": event.get("data_b64", ""),
+                "sample_rate": event.get("sample_rate", _DEFAULT_AUDIO_SAMPLE_RATE),
+                "node_id": event.get("node_id", ""),
+            })
+        elif event_name == "complete":
+            finished = True
+            final_output = dict(event.get("final_output") or {})
+            final_output.setdefault("output", "".join(token_buffer))
+            yield _build_sse_line({
+                "event": "complete",
+                "status": "success",
+                "final_output": final_output,
+            })
+        elif event_name == "error":
+            finished = True
+            yield _build_sse_line({
+                "event": "error",
+                "detail": event.get("detail", "Workflow error"),
+            })
+    if not finished:
+        raise RuntimeError("Workflow stream ended without a complete event")
+
+
+def _run_chat_and_stream(
+    query: str,
+    client_id: str,
+    uploaded_file_path: str | None = None,
+) -> Iterator[str]:
+    """Run the published workflow for a text and/or uploaded-file turn; yield SSE.
+
+    ``script.py`` is only introspected (credentials, ``query`` variable, audio Start
+    variable) — it is never executed. The backend creates/reuses a session and
+    calls ``/execute/stream`` directly.
+
+    Parameters
+    ----------
+    query : str
+        Text for the workflow's text Start variable. May be empty for voice-file turns.
+    client_id : str
+        Identifier for the user, used to persist the session across turns.
+    uploaded_file_path : str | None
+        Temporary uploaded file bound to the audio Start variable. Deleted when done.
+
+    Yields
+    ------
+    str
+        SSE-formatted lines (``token`` / ``audio_chunk`` / ``complete`` / ``error`` / ``[DONE]``).
+    """
+    assert isinstance(query, str), "query must be a string"
     has_upload = isinstance(uploaded_file_path, str) and bool(uploaded_file_path)
     if not query.strip() and not has_upload:
         raise ValueError("Provide a text query and/or an uploaded audio/file")
 
-    tmp_path: str | None = None
+    upload_handle = None
     try:
-        # ── Read and patch the script using AST ────────────────────────
-        with open(_SCRIPT_PATH, encoding="utf-8") as fh:
-            source = fh.read()
+        meta = _get_script_metadata()
+        session_id = _ensure_session_id(meta, client_id, _SESSION_NAME_CHAT)
 
-        meta = inspect_script(source)
-        # Dual-input: text query (omit files=) OR mic WAV upload bound to the
-        # multipart Start var discovered from script.py (empty query → STT).
+        text_inputs: dict[str, str] = (
+            {resolve_text_input_var_name(meta): query.strip()} if query.strip() else {}
+        )
+        form_data = {
+            "inputs": json.dumps(text_inputs),
+            "workflow_id": meta.workflow_id,
+            "session_id": session_id,
+        }
 
-        active_session_id = _SESSIONS.get(client_id)
-        files_map: dict[str, str] | None = None
+        upload_files: dict[str, tuple[str, Any, str]] | None = None
         if has_upload:
             assert uploaded_file_path is not None
-            files_map = _files_map_for_upload(meta, uploaded_file_path)
+            assert os.path.isfile(uploaded_file_path), f"upload missing: {uploaded_file_path}"
+            file_name = os.path.basename(uploaded_file_path)
+            mimetype = mimetypes.guess_type(file_name)[0] or _DEFAULT_UPLOAD_MIMETYPE
+            upload_handle = open(uploaded_file_path, "rb")
+            upload_files = {resolve_audio_stream_var_name(meta): (file_name, upload_handle, mimetype)}
 
-        # Rewrite the script with AST to inject inputs, files, and session
-        modified_source = rewrite_script(
-            script_source=source,
-            query=query.strip(),
-            session_id=active_session_id,
-            files=files_map,
-        )
-
-        # Write outside the backend package dir. With ``uvicorn --reload``,
-        # a temp ``.py`` next to ``main.py`` triggers WatchFiles, which
-        # restarts the server and raises KeyboardInterrupt in the subprocess.
-        with tempfile.NamedTemporaryFile(
-            mode="w",
-            suffix=".py",
-            delete=False,
-            encoding="utf-8",
-            dir=tempfile.gettempdir(),
-        ) as tmp:
-            tmp.write(modified_source)
-            tmp_path = tmp.name
-            assert isinstance(tmp_path, str) and len(tmp_path) > 0
-            assert os.path.isfile(tmp_path), f"Temp script missing after write: {tmp_path}"
-
-        # ── Run the script ────────────────────────────────────────────
-        env = os.environ.copy()
-        env["PYTHONUNBUFFERED"] = "1"
-
-        process = subprocess.Popen(
-            [sys.executable, tmp_path],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            env=env,
-        )
-
-        full_output: list[str] = []
-        final_output_payload: dict[str, Any] | None = None
-        stdout_fd = process.stdout.fileno()
-        # Incomplete last line held across reads so a multi-chunk
-        # __FINAL_OUTPUT__:<json> is never split into token events.
-        stdout_carry: str = ""
-
-        # Read stdout in real time — os.read returns whatever bytes are
-        # available without waiting to fill the buffer.
-        while True:
-            data = os.read(stdout_fd, _STDOUT_READ_SIZE)
-            if not data:
-                break
-            text = data.decode("utf-8", errors="replace")
-            full_output.append(text)
-            stdout_carry += text
-
-            visible_parts: list[str] = []
-            while True:
-                newline_at = stdout_carry.find("\n")
-                if newline_at < 0:
-                    break
-                line = stdout_carry[: newline_at + 1]
-                stdout_carry = stdout_carry[newline_at + 1 :]
-                stripped = line.strip()
-                if stripped.startswith(_FINAL_OUTPUT_MARKER):
-                    parsed = _parse_final_output_marker_line(stripped)
-                    if parsed is not None:
-                        final_output_payload = parsed
-                else:
-                    visible_parts.append(line)
-
-            # Flush partial text only when it cannot be a FINAL_OUTPUT line.
-            # Hold prefixes of the marker and any line that already started
-            # with the marker until the terminating newline arrives.
-            if stdout_carry and not _is_final_output_line_prefix(stdout_carry):
-                visible_parts.append(stdout_carry)
-                stdout_carry = ""
-
-            visible_text = "".join(visible_parts)
-            if visible_text:
-                yield _build_sse_line({"event": "token", "token": visible_text})
-
-        # EOF: resolve any trailing line that never received a newline.
-        if stdout_carry:
-            stripped = stdout_carry.strip()
-            if stripped.startswith(_FINAL_OUTPUT_MARKER):
-                parsed = _parse_final_output_marker_line(stripped)
-                if parsed is not None:
-                    final_output_payload = parsed
-            elif stripped:
-                yield _build_sse_line({"event": "token", "token": stdout_carry})
-
-        process.wait()
-
-        output_text = "".join(full_output).strip()
-        # Strip marker lines from the human-readable output_text
-        output_text = "\n".join(
-            line for line in output_text.splitlines()
-            if not line.strip().startswith(_FINAL_OUTPUT_MARKER)
-        ).strip()
-
-        if process.returncode != 0:
-            stderr_text = process.stderr.read().decode("utf-8", errors="replace")
-            yield _build_sse_line({
-                "event": "error",
-                "detail": stderr_text or f"Script exited with code {process.returncode}",
-            })
-        else:
-            # Build the complete event payload.  If the script emitted a
-            # __FINAL_OUTPUT__ marker, include all those fields (audio base64,
-            # mimetype, URLs, etc.) so the frontend can play the audio.
-            complete_payload: dict[str, Any] = {
-                "event": "complete",
-                "status": "success",
-                "final_output": {"output": output_text},
-            }
-            if final_output_payload is not None:
-                # Merge the rich payload: keep "output" as text fallback
-                # but add all audio and metadata fields.
-                complete_payload["final_output"].update(final_output_payload)
-            yield _build_sse_line(complete_payload)
-
+        resp = _post_execute_stream(meta, form_data, upload_files)
+        yield from _relay_execute_stream(resp, _session_cache_key(client_id, meta))
         yield "data: [DONE]\n\n"
-
     except Exception as exc:
-        error_detail = f"{type(exc).__name__}: {exc}\n{traceback.format_exc()}"
-        yield _build_sse_line({"event": "error", "detail": error_detail})
+        yield _build_sse_line({"event": "error", "detail": f"{type(exc).__name__}: {exc}"})
         yield "data: [DONE]\n\n"
     finally:
-        if tmp_path is not None:
+        if upload_handle is not None:
+            upload_handle.close()
+        if has_upload and uploaded_file_path:
             try:
-                os.unlink(tmp_path)
+                os.unlink(uploaded_file_path)
             except OSError:
                 pass
 
@@ -455,23 +450,13 @@ async def audio_stream_proxy(websocket: WebSocket, stream_id: str) -> None:
     # The upstream audio-streams endpoint requires both workflow_id and session_id
     # as query parameters when authenticating with X-Workflow-Key.
     client_id = str(websocket.client.host) if websocket.client else "default"
-    session_id = _SESSIONS.get(client_id)
-    if not session_id:
-        try:
-            sess_resp = requests.post(
-                f"{base_url}/sessions",
-                json={"workflow_id": meta.workflow_id, "name": "Audio session"},
-                headers={"X-Workflow-Key": meta.workflow_key},
-                timeout=15,
-            )
-            sess_resp.raise_for_status()
-            session_id = sess_resp.json()["session_id"]
-            _SESSIONS[client_id] = session_id
-        except Exception as exc:
-            await websocket.accept()
-            await websocket.send_text(json.dumps({"event": "error", "detail": f"Session creation failed: {exc}"}))
-            await websocket.close()
-            return
+    try:
+        session_id = _ensure_session_id(meta, client_id, _SESSION_NAME_AUDIO)
+    except Exception as exc:
+        await websocket.accept()
+        await websocket.send_text(json.dumps({"event": "error", "detail": f"Session creation failed: {exc}"}))
+        await websocket.close()
+        return
 
     upstream_url = (
         f"{base_url.replace('https://', 'wss://').replace('http://', 'ws://')}"
@@ -559,7 +544,7 @@ async def audio_execute(request: Request, stream_id: str = Form(...)) -> Streami
     )
 
 
-def _run_audio_and_stream(stream_id: str, client_id: str):
+def _run_audio_and_stream(stream_id: str, client_id: str) -> Iterator[str]:
     """Create/reuse a platform session, fire execute/stream with stream_refs,
     and yield SSE events back to the browser.
 
@@ -575,91 +560,23 @@ def _run_audio_and_stream(stream_id: str, client_id: str):
     str
         SSE-formatted event lines.
     """
+    assert isinstance(stream_id, str) and stream_id, "stream_id must be non-empty"
     try:
-        # Step 1: Introspect script.py for dynamic credentials and stream var name
         meta = _get_script_metadata()
-        assert meta.base_url, "BASE_URL not found in script.py"
+        session_id = _ensure_session_id(meta, client_id, _SESSION_NAME_AUDIO)
 
-        # Step 2: Obtain or reuse session
-        session_id = _SESSIONS.get(client_id)
-        if not session_id:
-            sess_resp = requests.post(
-                f"{meta.base_url}/sessions",
-                json={"workflow_id": meta.workflow_id, "name": "Audio session"},
-                headers={"X-Workflow-Key": meta.workflow_key},
-                timeout=15,
-            )
-            sess_resp.raise_for_status()
-            session_id = sess_resp.json()["session_id"]
-            _SESSIONS[client_id] = session_id
-
-        # Step 3: Resolve stream_refs key from stream_refs or files={...} in script.py.
-        # Paradigm publish snippets expose audio_stream as files={"query": ...},
-        # not as a stream_refs literal — never invent a hardcoded var name.
-        stream_var_name: str = resolve_audio_stream_var_name(meta)
-        assert stream_var_name, "stream_var_name must be non-empty"
-        assert isinstance(stream_id, str) and stream_id, "stream_id must be non-empty"
-
-        # Step 4: Fire execute/stream with stream_refs pointing at the live audio queue
-        resp = requests.post(
-            f"{meta.base_url}/execute/stream",
-            data={
-                "inputs": json.dumps({}),
-                "stream_refs": json.dumps({stream_var_name: stream_id}),
-                "workflow_id": meta.workflow_id,
-                "session_id": session_id,
-            },
-            headers={"X-Workflow-Key": meta.workflow_key},
-            stream=True,
-            timeout=120,
-        )
-        _raise_for_upstream_status(resp, "audio execute/stream")
-
-        # Step 5: Relay SSE events from upstream to browser.
-        # Handles both text (token) and audio (audio_chunk) output workflows.
-        token_buffer: list[str] = []
-        for raw_line in resp.iter_lines():
-            if not raw_line:
-                continue
-            line = raw_line.decode() if isinstance(raw_line, bytes) else raw_line
-            if line == "data: [DONE]":
-                break
-            if not line.startswith("data:"):
-                continue
-            event = json.loads(line[5:].strip())
-            ev = event.get("event")
-            if ev == "session":
-                new_sid = event.get("session_id")
-                if new_sid:
-                    _SESSIONS[client_id] = new_sid
-            elif ev == "token":
-                token_buffer.append(event.get("token", ""))
-                yield _build_sse_line({"event": "token", "token": event.get("token", "")})
-            elif ev == "audio_chunk":
-                # Forward audio chunk with its base64 PCM16 payload and sample rate
-                yield _build_sse_line({
-                    "event": "audio_chunk",
-                    "data_b64": event.get("data_b64", ""),
-                    "sample_rate": event.get("sample_rate", 24000),
-                    "node_id": event.get("node_id", ""),
-                })
-            elif ev == "complete":
-                final_output = event.get("final_output", {})
-                # Include the full final_output from upstream so the frontend
-                # receives audio_file_output_b64, mimetype, and URLs if present.
-                text_fallback = final_output.get("output") or "".join(token_buffer)
-                complete_payload = final_output.copy()
-                complete_payload.setdefault("output", text_fallback)
-                yield _build_sse_line({
-                    "event": "complete",
-                    "status": "success",
-                    "final_output": complete_payload,
-                })
-            elif ev == "error":
-                yield _build_sse_line({"event": "error", "detail": event.get("detail", "Audio workflow error")})
-
+        # Paradigm publish snippets expose audio_stream as files={"<var>": ...}, not
+        # as a stream_refs literal — the name is discovered, never hardcoded.
+        stream_var_name = resolve_audio_stream_var_name(meta)
+        form_data = {
+            "inputs": json.dumps({}),
+            "stream_refs": json.dumps({stream_var_name: stream_id}),
+            "workflow_id": meta.workflow_id,
+            "session_id": session_id,
+        }
+        resp = _post_execute_stream(meta, form_data)
+        yield from _relay_execute_stream(resp, _session_cache_key(client_id, meta))
         yield "data: [DONE]\n\n"
-
     except Exception as exc:
         yield _build_sse_line({"event": "error", "detail": f"{type(exc).__name__}: {exc}"})
         yield "data: [DONE]\n\n"
@@ -672,13 +589,19 @@ async def chat_stream(
     query: str = Form(default=""),
     file: UploadFile | None = File(default=None),
 ) -> StreamingResponse:
-    """Run script.py with text and/or an uploaded audio file; stream SSE.
+    """Run the workflow declared in script.py for a text and/or file turn; stream SSE.
+
+    The backend calls Paradigm ``/execute/stream`` directly (``script.py`` supplies
+    credentials and variable names only).
 
     Dual-input turns
     ----------------
-    * Text: non-empty ``query``, optional document attach.
+    * Text: non-empty ``query`` sent as the text Start variable (e.g. ``query``).
     * Voice file: empty ``query`` + audio ``file`` (mic recording as WAV) bound
       to the multipart Start variable name discovered from ``script.py``.
+
+    SSE events: ``token``, ``audio_chunk``, ``complete`` (``final_output`` with
+    ``output`` text and, when present, ``audio_file_output_b64``), ``error``.
     """
     assert isinstance(query, str), "query must be a string"
 
@@ -699,7 +622,7 @@ async def chat_stream(
         raise ValueError("Provide a text query and/or an uploaded audio/file")
 
     return StreamingResponse(
-        _run_script_and_stream(query, client_id, uploaded_path),
+        _run_chat_and_stream(query, client_id, uploaded_path),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",

@@ -1,105 +1,51 @@
-import requests, json
+"""Client for the published QA workflow "odisha wss voice and chat tool".
 
-WORKFLOW_KEY = "9qbAKOCaIQS-HqNbS0n_oGmDzX1TCkWV_GgR4taQuHM"
-WORKFLOW_ID  = "d9bbbd15-fb8b-432f-b418-754fb6a08ebd"
-BASE_URL     = "https://map-qa.paradigmit.ai/api/v1/agent-workflows"  # change if calling a different environment
+Ask by text or by voice; every answer comes back as text (`output`) AND speech
+(`audio_file_output`, saved to answer.wav). Reuse one session per conversation.
 
-# ── Step 1: Create a session (once per conversation) ──────────────────────
-# Each session accumulates execution history across multiple calls.
-# Re-use the same session_id for follow-up turns in the same conversation.
-session_resp = requests.post(
-    f"{BASE_URL}/sessions",
-    json={"workflow_id": WORKFLOW_ID, "name": "My session"},
-    headers={"X-Workflow-Key": WORKFLOW_KEY},
-)
-session_resp.raise_for_status()
-session_id = session_resp.json()["session_id"]
+Usage:
+    python3 odisha_wss_voice_chat_tool_client.py "How many tribes live in Odisha?"
+    python3 odisha_wss_voice_chat_tool_client.py --audio question.wav
+"""
+import argparse, base64, json
+import requests
 
-# ── Step 2: Execute ───────────────────────────────────────────────────────
-inputs = {}
-resp = requests.post(
-    f"{BASE_URL}/execute/stream",
-    data={
-        "inputs": json.dumps(inputs),
-        "workflow_id": WORKFLOW_ID,
-        "session_id": session_id,
-    },
-    headers={"X-Workflow-Key": WORKFLOW_KEY},
-    stream=True,
-)
+WORKFLOW_KEY = "BYIQFAXa29p0w3ehUYwRWNyUKpRJK3kLrCjA8uNky70"
+WORKFLOW_ID  = "3d5b85c2-a298-4183-b338-ede3c30e9168"
+BASE_URL     = "https://map-qa.paradigmit.ai/api/v1/agent-workflows"
+HEADERS      = {"X-Workflow-Key": WORKFLOW_KEY}
 
-# Optional: attach a file for variable 'audio_file_output'
-# with open("your_file.wav", "rb") as audio_file_output_f:
-#     resp = requests.post(
-#         f"{BASE_URL}/execute/stream",
-#         data={
-#             "inputs": json.dumps(inputs),
-#             "workflow_id": WORKFLOW_ID,
-#             "session_id": session_id,
-#         },
-#         files={"audio_file_output": audio_file_output_f},
-#         headers={"X-Workflow-Key": WORKFLOW_KEY},
-#         stream=True,
-#     )
+def create_session() -> str:
+    r = requests.post(f"{BASE_URL}/sessions", json={"workflow_id": WORKFLOW_ID, "name": "odisha chat"},
+                      headers=HEADERS, timeout=60)
+    r.raise_for_status()
+    return r.json()["session_id"]
 
-# Optional: attach a file for variable 'audio_input_stream'
-# with open("your_file.wav", "rb") as audio_input_stream_f:
-#     resp = requests.post(
-#         f"{BASE_URL}/execute/stream",
-#         data={
-#             "inputs": json.dumps(inputs),
-#             "workflow_id": WORKFLOW_ID,
-#             "session_id": session_id,
-#         },
-#         files={"audio_input_stream": audio_input_stream_f},
-#         headers={"X-Workflow-Key": WORKFLOW_KEY},
-#         stream=True,
-#     )
-resp.raise_for_status()
-
-# ── Step 3: Read the SSE stream ────────────────────────────────────────────
-# Events in order:
-#   session      — carries session_id + execution_id (always first)
-#   node_complete — after each node finishes: execution_ms, input, output,
-#                   token_usage, cost_usd, logs, status, error, session_id, execution_id
-#   complete     — final_output, node_traces, all_outputs, cost_usd, execution_path,
-#                   session_id, execution_id, total_execution_ms
-#   error        — on failure, carries detail + session_id
-result = None
-execution_id = None
-for raw_line in resp.iter_lines():
-    if not raw_line:
-        continue
-    line = raw_line.decode() if isinstance(raw_line, bytes) else raw_line
-    if line == "data: [DONE]":
-        break
-    if not line.startswith("data:"):
-        continue
-    event = json.loads(line[len("data:"):].strip())
-    ev = event.get("event")
-    if ev == "session":
-        execution_id = event.get("execution_id")
-    elif ev == "complete":
-        result = event
-    elif ev == "error":
-        raise RuntimeError(f"Workflow error: {event.get('detail')}")
-print()
-
-if result is None:
+def ask(session_id, question=None, audio_path=None) -> dict:
+    data = {"inputs": json.dumps({"query": question} if question else {}),
+            "workflow_id": WORKFLOW_ID, "session_id": session_id}
+    files = {"audio_input_stream": (audio_path, open(audio_path, "rb"), "audio/wav")} if audio_path else None
+    r = requests.post(f"{BASE_URL}/execute/stream", data=data, files=files, headers=HEADERS,
+                      stream=True, timeout=900)
+    r.raise_for_status()
+    for raw in r.iter_lines():
+        line = raw.decode() if isinstance(raw, bytes) else raw
+        if not line.startswith("data:") or line == "data: [DONE]":
+            continue
+        event = json.loads(line[5:].strip())
+        if event.get("event") == "error":
+            raise RuntimeError(event.get("detail"))
+        if event.get("event") == "complete":
+            return event["final_output"]
     raise RuntimeError("Stream ended without a complete event")
 
-# ── Step 4: Read output ────────────────────────────────────────────────────
-# Output structure:
-# {
-#     "audio_file_output": "...",
-#     "output": "...",
-# }
-final_output = result["final_output"]
-audio_file_output = final_output["audio_file_output"]
-output = final_output["output"]
+if __name__ == "__main__":
+    p = argparse.ArgumentParser(); p.add_argument("question", nargs="?"); p.add_argument("--audio")
+    a = p.parse_args()
+    out = ask(create_session(), question=a.question, audio_path=a.audio)
+    print("Answer:", out["output"])
+    if out.get("audio_file_output_b64"):
+        open("answer.wav", "wb").write(base64.b64decode(out["audio_file_output_b64"]))
+        print("Spoken answer saved to answer.wav")
 
-# ── Optional: retrieve full session history ─────────────────────────────────
-# session_detail = requests.get(
-#     f"{BASE_URL}/sessions/{session_id}",
-#     headers={"X-Workflow-Key": WORKFLOW_KEY},
-# ).json()
+ 

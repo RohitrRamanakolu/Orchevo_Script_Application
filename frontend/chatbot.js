@@ -213,7 +213,7 @@ function appendUserMessage(text, file = null) {
   `;
 
   messagesList.appendChild(rowEl);
-  scrollToBottom();
+  scrollToBottom(true);
 }
 
 /**
@@ -248,7 +248,7 @@ function createAssistantCard() {
   rowEl.innerHTML = `<div class="msg-avatar-ai">AI</div>`;
   rowEl.appendChild(cardEl);
   messagesList.appendChild(rowEl);
-  scrollToBottom();
+  scrollToBottom(true);
 
   return { row: rowEl, textContainer, audioReplayContainer };
 }
@@ -315,7 +315,7 @@ async function sendMessage(query, fileOverride, displayOverride) {
   }
 
   const { textContainer, audioReplayContainer } = createAssistantCard();
-
+  scrollToBottom(true);
 
   let tokenBuffer = "";
   let hasReceivedToken = false;
@@ -433,13 +433,34 @@ async function sendMessage(query, fileOverride, displayOverride) {
 
 /* ── UI Helpers & Dictation ───────────────────────────────────────────── */
 
-/** Scroll chat area to bottom if needed. */
-function scrollToBottom() {
-  const { scrollTop, scrollHeight, clientHeight } = chatViewport;
-  const dist = scrollHeight - scrollTop - clientHeight;
-  if (dist < AUTO_SCROLL_THRESHOLD_PX || isStreaming) {
-    chatViewport.scrollTop = scrollHeight;
-  }
+/**
+ * Scroll the chat viewport to the latest message.
+ * Prefers ``scrollIntoView`` on the last row; retries after layout frames.
+ *
+ * @param {boolean} [force=false]  Always scroll; ignore near-bottom threshold.
+ */
+function scrollToBottom(force) {
+  assert: chatViewport instanceof HTMLElement;
+  const dist =
+    chatViewport.scrollHeight - chatViewport.scrollTop - chatViewport.clientHeight;
+  const shouldScroll =
+    Boolean(force) || isStreaming || dist < AUTO_SCROLL_THRESHOLD_PX;
+  if (!shouldScroll) return;
+
+  const apply = () => {
+    const lastRow = messagesList
+      ? messagesList.querySelector(".msg-row:last-child")
+      : null;
+    if (lastRow instanceof HTMLElement) {
+      lastRow.scrollIntoView({ block: "end", inline: "nearest", behavior: "auto" });
+    }
+    chatViewport.scrollTop = chatViewport.scrollHeight;
+  };
+  apply();
+  requestAnimationFrame(() => {
+    apply();
+    requestAnimationFrame(apply);
+  });
 }
 
 /**
